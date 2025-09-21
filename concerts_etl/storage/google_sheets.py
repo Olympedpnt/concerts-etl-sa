@@ -39,11 +39,12 @@ def upsert_rows(events: Iterable[NormalizedEvent]) -> str:
         ws = sh.add_worksheet(settings.gsheet_worksheet, rows=2000, cols=30)
 
     header = [
-        "provider","event_id_provider","event_name","city","country",
-        "event_datetime_local","timezone","status","tickets_sold_total",
-        "tickets_sold_today","gross_total","gross_today","net_total",
-        "currency","sell_through_pct","scrape_ts_utc","ingestion_run_id"
-    ]
+    "provider","event_id_provider","event_name","city","country",
+    "event_datetime_local","timezone","status","tickets_sold_total",
+    "gross_total","net_total","currency","sell_through_pct",
+    "scrape_ts_utc","ingestion_run_id"
+]
+
 
     existing = ws.get_all_values()
     if not existing or existing[0] != header:
@@ -52,25 +53,24 @@ def upsert_rows(events: Iterable[NormalizedEvent]) -> str:
 
     rows: List[list] = []
     for e in events:
-        rows.append([
-            e.provider,
-            e.event_id_provider,
-            e.event_name,
-            e.city,
-            e.country,
-            e.event_datetime_local.isoformat() if e.event_datetime_local else "",
-            e.timezone,
-            e.status,
-            e.tickets_sold_total,
-            e.tickets_sold_today,
-            e.gross_total,
-            e.gross_today,
-            e.net_total,
-            e.currency,
-            e.sell_through_pct,
-            e.scrape_ts_utc.isoformat(),
-            e.ingestion_run_id,
-        ])
+            rows.append([
+        e.provider,
+        e.event_id_provider,
+        e.event_name,
+        e.city,
+        e.country,
+        e.event_datetime_local.isoformat() if e.event_datetime_local else "",
+        e.timezone,
+        e.status,
+        e.tickets_sold_total,
+        e.gross_total,
+        e.net_total,
+        e.currency,
+        e.sell_through_pct,
+        e.scrape_ts_utc.isoformat(),
+        e.ingestion_run_id,
+    ])
+
 
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
@@ -85,15 +85,15 @@ def export_csv(events: Iterable[NormalizedEvent], out_dir: str) -> str:
         w.writerow([
             "provider","event_id_provider","event_name","city","country",
             "event_datetime_local","timezone","status","tickets_sold_total",
-            "tickets_sold_today","gross_total","gross_today","net_total",
+            "gross_total","net_total",
             "currency","sell_through_pct","scrape_ts_utc","ingestion_run_id"
         ])
         for e in events:
             w.writerow([
                 e.provider, e.event_id_provider, e.event_name, e.city, e.country,
                 e.event_datetime_local.isoformat() if e.event_datetime_local else "",
-                e.timezone, e.status, e.tickets_sold_total, e.tickets_sold_today,
-                e.gross_total, e.gross_today, e.net_total, e.currency,
+                e.timezone, e.status, e.tickets_sold_total,
+                e.gross_total, e.net_total, e.currency,
                 e.sell_through_pct, e.scrape_ts_utc.isoformat(), e.ingestion_run_id
             ])
     return path
