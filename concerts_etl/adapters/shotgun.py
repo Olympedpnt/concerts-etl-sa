@@ -90,19 +90,77 @@ async def _collect_cards() -> List[RawShotgunCard]:
             await page.goto(EVENTS_URL, wait_until="domcontentloaded")
 
         # ---------- EVENTS ----------
-        await page.goto(EVENTS_URL)
-        cards = await page.query_selector_all("div.relative.flex.h-full.w-full.flex-col")
+        await page.goto(EVENTS_URL, wait_until="domcontentloaded")
+
+        # (1) Clique l'onglet "Publié" si présent
+        try:
+            tab_publie = page.get_by_role("tab", name=re.compile(r"publié", re.I))
+            if await tab_publie.is_visible(timeout=2000):
+                await tab_publie.click()
+        except Exception:
+            pass
+
+        # (2) Attends qu'au moins une statistique apparaisse (classe Ant Design)
+        try:
+            await page.wait_for_selector(".ant-statistic-content", timeout=15000)
+        except Exception:
+            # on continue, mais on dump si 0 carte
+            pass
+
+        # (3) Scroll pour charger (infini)
+        async def auto_scroll():
+            prev = 0
+            for _ in range(8):   # 8 rafales suffisent pour une liste courte/moyenne
+                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(700)
+                height = await page.evaluate("document.body.scrollHeight")
+                if height == prev:
+                    break
+                prev = height
+
+        await auto_scroll()
+
+        # (4) Sélecteurs de cartes — on tente plusieurs patterns
+        selectors = [
+            "div.relative.flex.h-full.w-full.flex-col",   # vu dans ton extrait
+            "[class*='relative'][class*='flex'][class*='flex-col']",
+            "[data-testid='event-card']"
+        ]
+        cards = []
+        for sel in selectors:
+            cards = await page.query_selector_all(sel)
+            if cards:
+                break
+
+        # DEBUG si rien trouvé
+        if not cards:
+            try:
+                await page.screenshot(path="events_empty.png", full_page=True)
+                html = await page.content()
+                with open("events.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+            except Exception:
+                pass
+            return []  # pas de carte → l'ETL retournera no_data (et on aura artefacts)
 
         results: List[RawShotgunCard] = []
         for c in cards:
+            # nom
             name_el = await c.query_selector("span.truncate.text-sm.font-medium")
+            if not name_el:
+                # fallback: premier <span> gras dans le bloc
+                name_el = await c.query_selector("span.font-medium, h3, a[title]")
             name = (await name_el.inner_text()).strip() if name_el else None
             if not name:
                 continue
 
+            # date locale
             date_el = await c.query_selector("span.text-white-700.text-xs.font-normal")
+            if not date_el:
+                date_el = await c.query_selector("time, [class*='text-xs']")
             dt_text = (await date_el.inner_text()).strip() if date_el else None
 
+            # stats € et #
             values = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-value")
             suffixes = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-suffix")
 
@@ -121,17 +179,17 @@ async def _collect_cards() -> List[RawShotgunCard]:
                 else:
                     ints.append((_parse_int(txt), await has_today(i)))
 
-            gross_total, gross_today = None, None
+            gross_total = gross_today = None
             for val, today in euros:
                 if today: gross_today = val
                 elif gross_total is None: gross_total = val
 
-            tickets_total, tickets_today = None, None
+            tickets_total = tickets_today = None
             for val, today in ints:
                 if today: tickets_today = val
                 elif tickets_total is None: tickets_total = val
 
-            pct_el = await c.query_selector("span.text-xs.font-semibold")
+            pct_el = await c.query_selector("span.text-xs.font-semibold, [class*='font-semibold']")
             sell_through_pct = float(_parse_int(await pct_el.inner_text()) or 0) if pct_el else None
 
             full_text = await c.inner_text()
@@ -139,12 +197,22 @@ async def _collect_cards() -> List[RawShotgunCard]:
 
             event_id_provider = _stable_event_id(name, dt_text)
 
-            # tentative parsing date
             event_dt = None
             if dt_text:
                 try:
-                    cleaned = dt_text.replace("oct.", "oct").replace("nov.", "nov")
-                    event_dt = datetime.strptime(cleaned, "%a %d %b %Y %H:%M")
+                    cleaned = (dt_text
+                               .replace("lun.", "lun").replace("mar.", "mar").replace("mer.", "mer")
+                               .replace("jeu.", "jeu").replace("ven.", "ven").replace("sam.", "sam").replace("dim.", "dim")
+                               .replace("janv.", "janv").replace("févr.", "fév").replace("avr.", "avr")
+                               .replace("juil.", "juil").replace("sept.", "sept").replace("oct.", "oct")
+                               .replace("nov.", "nov").replace("déc.", "déc"))
+                    # best-effort; si fail -> None
+                    from datetime import datetime as _dt
+                    for fmt in ("%a %d %b %Y %H:%M", "%a %d %b. %Y %H:%M"):
+                        try:
+                            event_dt = _dt.strptime(cleaned, fmt); break
+                        except Exception:
+                            pass
                 except Exception:
                     event_dt = None
 
@@ -167,6 +235,7 @@ async def _collect_cards() -> List[RawShotgunCard]:
 
         await context.close(); await browser.close()
         return results
+
 
 # ------------------ Normalisation ------------------
 

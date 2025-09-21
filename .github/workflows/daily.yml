@@ -2,19 +2,22 @@ name: daily-shotgun
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC = 08:00 Paris
-  workflow_dispatch: {}
+    - cron: "0 6 * * *"   # 06:00 UTC = 08:00 Europe/Paris
+  workflow_dispatch: {}   # permet de lancer à la main
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
+      # --- Checkout code ---
       - uses: actions/checkout@v4
 
+      # --- Python 3.11 ---
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # --- Dépendances ---
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -22,27 +25,23 @@ jobs:
           playwright install --with-deps chromium
           pip install gspread google-auth google-auth-oauthlib python-dotenv
 
+      # --- Config secrets (Service Account JSON) ---
       - name: Configure env
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
         run: |
-          set -euxo pipefail
           echo "${GCP_SA_JSON}" > "$RUNNER_TEMP/sa.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> $GITHUB_ENV
 
-      - name: Diag (env + import + sheets)
-        env:
-          SHOTGUN_EMAIL: ${{ secrets.SHOTGUN_EMAIL }}
-          SHOTGUN_PASSWORD: ${{ secrets.SHOTGUN_PASSWORD }}
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GSHEET_DOC_TITLE: "Concerts Pointages"
-          GSHEET_WORKSHEET: "shotgun_events"
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+      # --- Diag step (facultatif mais utile) ---
+      - name: Diag env
         run: |
-          python .github/scripts/diag.py
+          echo "Python $(python --version)"
+          ls -lh $GOOGLE_APPLICATION_CREDENTIALS || true
+          head -n 5 $GOOGLE_APPLICATION_CREDENTIALS || true
 
+      # --- Run ETL ---
       - name: Run ETL
-        if: success()   # n'exécute que si la DIAG passe
         env:
           SHOTGUN_EMAIL: ${{ secrets.SHOTGUN_EMAIL }}
           SHOTGUN_PASSWORD: ${{ secrets.SHOTGUN_PASSWORD }}
@@ -53,8 +52,9 @@ jobs:
         run: |
           python -m concerts_etl run || (echo "ETL failed, dumping debug" && exit 1)
 
-      - name: Upload debug artifacts
-        if: failure()    # seulement si le job échoue
+      # --- Debug login (si échec login) ---
+      - name: Upload login debug
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: login-debug
@@ -63,11 +63,22 @@ jobs:
             login_error.html
           if-no-files-found: ignore
 
-
-      - name: Upload exports (optional)
+      # --- Debug events (si aucune donnée) ---
+      - name: Upload events debug
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: exports
+          name: events-debug
+          path: |
+            events.html
+            events_empty.png
+          if-no-files-found: ignore
+
+      # --- Export CSV (optionnel) ---
+      - name: Upload CSV exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-exports
           path: exports
           if-no-files-found: ignore
