@@ -1,0 +1,49 @@
+# (même contenu que ci-dessus)
+name: daily-shotgun
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          playwright install --with-deps chromium
+      - name: Configure env
+        env:
+          SHOTGUN_EMAIL: ${{ secrets.SHOTGUN_EMAIL }}
+          SHOTGUN_PASSWORD: ${{ secrets.SHOTGUN_PASSWORD }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_DOC_TITLE: "Concerts Pointages"
+          GSHEET_WORKSHEET: "shotgun_events"
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL_TO: "olympe.dupont@gmail.com"
+          ALERT_EMAIL_FROM: "alerts@yourdomain.tld"
+        run: |
+          echo "${{ secrets.GCP_SA_JSON }}" > "$GOOGLE_APPLICATION_CREDENTIALS"
+      - name: Run ETL
+        env:
+          SHOTGUN_EMAIL: ${{ secrets.SHOTGUN_EMAIL }}
+          SHOTGUN_PASSWORD: ${{ secrets.SHOTGUN_PASSWORD }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_DOC_TITLE: "Concerts Pointages"
+          GSHEET_WORKSHEET: "shotgun_events"
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL_TO: "olympe.dupont@gmail.com"
+          ALERT_EMAIL_FROM: "alerts@yourdomain.tld"
+        run: python -m concerts_etl run
