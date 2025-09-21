@@ -53,6 +53,17 @@ jobs:
         run: |
           python -m concerts_etl run || (echo "ETL failed, dumping debug" && exit 1)
 
+      - name: Upload debug artifacts
+        if: failure()    # seulement si le job échoue
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-debug
+          path: |
+            login_error.png
+            login_error.html
+          if-no-files-found: ignore
+
+
       - name: Upload exports (optional)
         if: always()
         uses: actions/upload-artifact@v4
