@@ -174,7 +174,40 @@ async def run() -> List[NormalizedEvent]:
         await page.wait_for_load_state("networkidle")
 
         # --- events list ---
-        await page.wait_for_selector("div.EventListItemGrid__EventListCard-sc-7aonoz-11", timeout=20000)
+        # on est censé être sur /events/live
+        try:
+            await page.wait_for_url("**/events/live*", timeout=20000)
+        except Exception:
+            await page.goto(LIVE_URL, wait_until="domcontentloaded")
+
+        await page.wait_for_load_state("networkidle")
+
+        # selectors Dice (React génère souvent des suffixes différents)
+        selectors = [
+            "div[class*='EventListItemGrid__EventListCard']",
+            "div[data-testid='event-list-item']"
+        ]
+
+        found = None
+        for sel in selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=15000)
+                found = sel
+                break
+            except Exception:
+                continue
+
+        if not found:
+            # dump debug
+            try:
+                await page.screenshot(path="events_error.png", full_page=True)
+                with open("events_error.html", "w", encoding="utf-8") as f:
+                    f.write(await page.content())
+            except Exception:
+                pass
+            log.warning("Aucun événement Dice détecté → retour liste vide")
+            await context.close(); await browser.close()
+            return []   # ne plante pas, retourne liste vide
 
         # scroll pour charger ~10 cartes
         async def auto_scroll():
@@ -183,12 +216,11 @@ async def run() -> List[NormalizedEvent]:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(600)
                 h = await page.evaluate("document.body.scrollHeight")
-                if h == last:
-                    break
+                if h == last: break
                 last = h
         await auto_scroll()
 
-        cards = await page.query_selector_all("div.EventListItemGrid__EventListCard-sc-7aonoz-11")
+        cards = await page.query_selector_all(found)
         out: List[NormalizedEvent] = []
 
         for card in cards:
