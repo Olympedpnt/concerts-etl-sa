@@ -20,7 +20,7 @@ def _strip_accents(s: str) -> str:
 
 MONTHS = {
     "janv": 1, "jan": 1,
-    "fevr": 2, "févr": 2, "fev": 2, "fe": 2,
+    "fevr": 2, "févr": 2, "fev": 2,
     "mars": 3, "mar": 3,
     "avr": 4, "avril": 4,
     "mai": 5,
@@ -81,15 +81,16 @@ async def run() -> List[NormalizedEvent]:
             args=["--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
-            locale="fr-FR", timezone_id="Europe/Paris",
+            locale="fr-FR",
+            timezone_id="Europe/Paris",
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
         )
         page = await context.new_page()
-        # --- login (redirige souvent vers /auth/login) ---
-        # Aller direct sur /auth/login pour éviter les attentes
+
+        # --- login ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-        # bouton cookies (si présent)
+        # cookies (si présents)
         try:
             btn = page.get_by_role("button", name=re.compile(r"(Accepter|Tout accepter|J.?accepte|Accept all)", re.I))
             if await btn.is_visible(timeout=2000):
@@ -97,33 +98,20 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # localiser l'input email (placeholder/label/type) — avec fallback
-        async def find_email(frame):
-            locs = [
-                frame.get_by_placeholder(re.compile(r"(e.?mail)", re.I)),
-                frame.get_by_label(re.compile(r"(e.?mail)", re.I)),
-                frame.locator('input[type="email"]')
-            ]
-            for loc in locs:
-                try:
-                    el = loc.first
-                    await el.wait_for(state="visible", timeout=4000)
-                    return el
-                except Exception:
-                    continue
-            return None
+        try:
+            # champs simples par placeholder
+            email = page.locator('input[placeholder="Email address"]')
+            await email.wait_for(state="visible", timeout=7000)
+            await email.fill(settings.dice_email)
 
-        email = await find_email(page)
-        if not email:
-            # certaines versions sont dans un iframe
-            for f in page.frames:
-                if f == page.main_frame: 
-                    continue
-                email = await find_email(f)
-                if email:
-                    page = f
-                    break
-        if not email:
+            pwd = page.locator('input[placeholder="Password"]')
+            await pwd.wait_for(state="visible", timeout=7000)
+            await pwd.fill(settings.dice_password)
+
+            submit = page.locator('button[type="submit"]')
+            await submit.wait_for(state="visible", timeout=5000)
+            await submit.click()
+        except Exception:
             # dump pour debug et échouer
             try:
                 await page.screenshot(path="login_error.png", full_page=True)
@@ -131,49 +119,16 @@ async def run() -> List[NormalizedEvent]:
                     f.write(await page.content())
             except Exception:
                 pass
-            raise RuntimeError("Champ email introuvable sur /auth/login")
+            raise RuntimeError("Impossible de remplir/valider le formulaire de login Dice")
 
-        # mot de passe
-        pwd = None
-        for loc in [page.get_by_label(re.compile(r"(mot de passe|password)", re.I)),
-                    page.get_by_placeholder(re.compile(r"(mot de passe|password)", re.I)),
-                    page.locator('input[type="password"]')]:
-            try:
-                el = loc.first
-                await el.wait_for(state="visible", timeout=3000)
-                pwd = el; break
-            except Exception:
-                continue
-        if not pwd:
-            raise RuntimeError("Champ mot de passe introuvable")
-
-        await email.fill(settings.dice_email)
-        await pwd.fill(settings.dice_password)
-
-        # bouton submit
-        submit = None
-        for loc in [page.locator('button[type="submit"]').first,
-                    page.get_by_role("button", name=re.compile(r"(se connecter|log in|sign in)", re.I)).first]:
-            try:
-                await loc.wait_for(state="enabled", timeout=3000)
-                submit = loc; break
-            except Exception:
-                continue
-        if not submit:
-            raise RuntimeError("Bouton de connexion introuvable")
-
-        await submit.click()
-
-        # attendre la redirection vers /events/live
+        # redirection vers la liste
         try:
             await page.wait_for_url("**/events/live*", timeout=45000)
         except Exception:
-            # navigation explicite si la redirection n'a pas abouti
             await page.goto(LIVE_URL, wait_until="domcontentloaded")
 
         # --- events list ---
-        # attendre la présence d'au moins une carte
-        await page.wait_for_selector("a.EventListItemGrid__EventName-sc-7aonoz-8", timeout=20000)
+        await page.wait_for_selector("div.EventListItemGrid__EventListCard-sc-7aonoz-11", timeout=20000)
 
         # scroll pour charger ~10 cartes
         async def auto_scroll():
@@ -182,7 +137,8 @@ async def run() -> List[NormalizedEvent]:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(600)
                 h = await page.evaluate("document.body.scrollHeight")
-                if h == last: break
+                if h == last:
+                    break
                 last = h
         await auto_scroll()
 
