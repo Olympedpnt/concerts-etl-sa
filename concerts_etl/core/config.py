@@ -16,4 +16,7 @@ class Settings:
     smtp_pass: str = os.getenv("SMTP_PASS","")
     alert_email_to: str = os.getenv("ALERT_EMAIL_TO","")
     alert_email_from: str = os.getenv("ALERT_EMAIL_FROM","alerts@example.org")
+    dice_email: str = os.getenv("DICE_EMAIL","")
+    dice_password: str = os.getenv("DICE_PASSWORD","")
+
 settings = Settings()

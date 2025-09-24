@@ -45,12 +45,14 @@ jobs:
         env:
           SHOTGUN_EMAIL: ${{ secrets.SHOTGUN_EMAIL }}
           SHOTGUN_PASSWORD: ${{ secrets.SHOTGUN_PASSWORD }}
+          DICE_EMAIL: ${{ secrets.DICE_EMAIL }}
+          DICE_PASSWORD: ${{ secrets.DICE_PASSWORD }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_DOC_TITLE: "Concerts Pointages"
           GSHEET_WORKSHEET: "shotgun_events"
           GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
         run: |
-          python -m concerts_etl run || (echo "ETL failed, dumping debug" && exit 1)
+          python -m concerts_etl run
 
       # --- Debug login (si échec login) ---
       - name: Upload login debug
