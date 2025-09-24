@@ -10,6 +10,17 @@ async def run_all() -> int:
     # 1) collecter
     sg = await REGISTRY["shotgun"]()
     dc = await REGISTRY["dice"]()
+
+    # comptage & exemples (logs)
+    logging.info("collected", extra={"shotgun": len(sg), "dice": len(dc)})
+    try:
+        eg = {"shotgun": [(e.event_name, e.tickets_sold_total) for e in sg[:3]],
+              "dice": [(e.event_name, e.tickets_sold_total) for e in dc[:3]]}
+        with open("providers_preview.json", "w", encoding="utf-8") as f:
+            import json; json.dump(eg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
     # 2) fusionner
     rows = merge_shotgun_dice(sg, dc, hour_tolerance_min=30, name_threshold=0.90)
     if not rows:

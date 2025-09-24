@@ -76,6 +76,28 @@ jobs:
             events_empty.png
           if-no-files-found: ignore
 
+      - name: Upload Dice debug
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dice-debug
+          path: |
+            dice_cards_count.txt
+            dice_diag.txt
+            dice_events_preview.json
+            events_error.html
+            events_error.png
+          if-no-files-found: ignore
+
+      - name: Upload providers preview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: providers-preview
+          path: providers_preview.json
+          if-no-files-found: ignore
+
+
       # --- Export CSV (optionnel) ---
       - name: Upload CSV exports
         if: always()

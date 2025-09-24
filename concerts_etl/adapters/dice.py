@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re, uuid, logging, unicodedata
+import re, uuid, logging, unicodedata, json
 from datetime import datetime, timezone
 from typing import List, Optional
 from tenacity import retry, wait_exponential, stop_after_attempt
@@ -20,7 +20,7 @@ def _strip_accents(s: str) -> str:
 
 MONTHS = {
     "janv": 1, "jan": 1,
-    "fevr": 2, "févr": 2, "fev": 2,
+    "fevr": 2, "févr": 2, "fev": 2, "fe": 2,
     "mars": 3, "mar": 3,
     "avr": 4, "avril": 4,
     "mai": 5,
@@ -34,17 +34,13 @@ MONTHS = {
 }
 
 def _parse_fr_date(date_text: str, time_text: str) -> Optional[datetime]:
-    # ex: "ven. 10 oct. 2025", "19:30"
     if not date_text or not time_text:
         return None
-    s = _strip_accents(date_text.lower())
-    s = s.replace(".", " ")
+    s = _strip_accents(date_text.lower()).replace(".", " ")
     m = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", s)
     if not m:
         return None
-    day = int(m.group(1))
-    mon_key = m.group(2)[:4]
-    year = int(m.group(3))
+    day, mon_key, year = int(m.group(1)), m.group(2)[:4], int(m.group(3))
     month = MONTHS.get(mon_key)
     if not month:
         return None
@@ -53,22 +49,15 @@ def _parse_fr_date(date_text: str, time_text: str) -> Optional[datetime]:
         return None
     hh, mm = int(tm.group(1)), int(tm.group(2))
     try:
-        # naïf en local; l'affichage restera "Europe/Paris" côté NormalizedEvent
         return datetime(year, month, day, hh, mm)
     except Exception:
         return None
 
 def _extract_id(href: str) -> str:
-    # /events/RXZlbnQ6NDk2NDE3/overview -> RXZlbnQ6NDk2NDE3
     m = re.search(r"/events/([^/]+)/", href or "")
     return m.group(1) if m else href or ""
 
-def _parse_sold(text: str) -> Optional[int]:
-    # "9/9" -> 9
-    if not text:
-        return None
-    m = re.search(r"(\d+)\s*/\s*\d+", text.replace("\xa0", ""))
-    return int(m.group(1)) if m else None
+# --- main ---
 
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 async def run() -> List[NormalizedEvent]:
@@ -83,7 +72,8 @@ async def run() -> List[NormalizedEvent]:
         context = await browser.new_context(
             locale="fr-FR",
             timezone_id="Europe/Paris",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome Safari"
         )
         page = await context.new_page()
 
@@ -91,103 +81,38 @@ async def run() -> List[NormalizedEvent]:
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # cookies (si présents)
+        # email
         try:
-            btn = page.get_by_role("button", name=re.compile(r"(Accepter|Tout accepter|J.?accepte|Accept all)", re.I))
-            if await btn.is_visible(timeout=2000):
-                await btn.click()
+            email = page.get_by_label(re.compile("Email address", re.I)).first
+            await email.wait_for(state="visible", timeout=5000)
         except Exception:
-            pass
+            email = page.locator('input[type="email"]').first
 
-        # helpers robustes (label -> role -> placeholder -> fallback)
-        async def fill_textbox(name_text: str, secret: str = "", is_password: bool = False):
-            el = None
-            # 1) par LABEL explicite
-            try:
-                el = page.get_by_label(re.compile(fr"^{re.escape(name_text)}$", re.I)).first
-                await el.wait_for(state="visible", timeout=4000)
-            except Exception:
-                el = None
-            # 2) par ROLE textbox avec nom accessible
-            if el is None:
-                try:
-                    el = page.get_by_role("textbox", name=re.compile(fr"^{re.escape(name_text)}$", re.I)).first
-                    await el.wait_for(state="visible", timeout=4000)
-                except Exception:
-                    el = None
-            # 3) par placeholder (au cas où)
-            if el is None:
-                placeholder = "Password" if is_password else "Email address"
-                try:
-                    el = page.locator(f'input[placeholder="{placeholder}"]').first
-                    await el.wait_for(state="visible", timeout=3000)
-                except Exception:
-                    el = None
-            # 4) dernier recours: premier input de type correspondant
-            if el is None:
-                css = 'input[type="password"]' if is_password else 'input[type="text"], input[type="email"]'
-                try:
-                    el = page.locator(css).first
-                    await el.wait_for(state="visible", timeout=3000)
-                except Exception:
-                    el = None
-
-            if el is None:
-                raise RuntimeError(f"Champ {name_text} introuvable")
-
-            await el.click()
-            await el.fill(secret)
-
+        # password
         try:
-            await fill_textbox("Email address", settings.dice_email, is_password=False)
-            await fill_textbox("Password", settings.dice_password, is_password=True)
-
-            submit = None
-            for loc in [
-                page.locator('button[type="submit"]').first,
-                page.get_by_role("button", name=re.compile(r"^(sign in|se connecter)$", re.I)).first,
-            ]:
-                try:
-                    await loc.wait_for(state="visible", timeout=3000)
-                    submit = loc
-                    break
-                except Exception:
-                    continue
-            if submit is None:
-                raise RuntimeError("Bouton de connexion introuvable")
-
-            await submit.click()
+            pwd = page.get_by_label(re.compile("Password", re.I)).first
+            await pwd.wait_for(state="visible", timeout=5000)
         except Exception:
-            try:
-                await page.screenshot(path="login_error.png", full_page=True)
-                with open("login_error.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            raise RuntimeError("Impossible de remplir/valider le formulaire de login Dice")
+            pwd = page.locator('input[type="password"]').first
 
-        # redirection vers la liste
+        await email.fill(settings.dice_email)
+        await pwd.fill(settings.dice_password)
+
+        submit = page.locator('button[type="submit"]').first
+        await submit.click()
+
         try:
             await page.wait_for_url("**/events/live*", timeout=45000)
         except Exception:
             await page.goto(LIVE_URL, wait_until="domcontentloaded")
+
         await page.wait_for_load_state("networkidle")
 
         # --- events list ---
-        # on est censé être sur /events/live
-        try:
-            await page.wait_for_url("**/events/live*", timeout=20000)
-        except Exception:
-            await page.goto(LIVE_URL, wait_until="domcontentloaded")
-
-        await page.wait_for_load_state("networkidle")
-
-        # selectors Dice (React génère souvent des suffixes différents)
         selectors = [
             "div[class*='EventListItemGrid__EventListCard']",
             "div[data-testid='event-list-item']"
         ]
-
         found = None
         for sel in selectors:
             try:
@@ -198,7 +123,6 @@ async def run() -> List[NormalizedEvent]:
                 continue
 
         if not found:
-            # dump debug
             try:
                 await page.screenshot(path="events_error.png", full_page=True)
                 with open("events_error.html", "w", encoding="utf-8") as f:
@@ -207,42 +131,83 @@ async def run() -> List[NormalizedEvent]:
                 pass
             log.warning("Aucun événement Dice détecté → retour liste vide")
             await context.close(); await browser.close()
-            return []   # ne plante pas, retourne liste vide
-
-        # scroll pour charger ~10 cartes
-        async def auto_scroll():
-            last = 0
-            for _ in range(6):
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(600)
-                h = await page.evaluate("document.body.scrollHeight")
-                if h == last: break
-                last = h
-        await auto_scroll()
+            return []
 
         cards = await page.query_selector_all(found)
+
+        # diag: combien de cartes
+        try:
+            with open("dice_cards_count.txt", "w", encoding="utf-8") as f:
+                f.write(str(len(cards)))
+        except Exception:
+            pass
+
         out: List[NormalizedEvent] = []
 
         for card in cards:
-            # name + id
-            a = await card.query_selector("a.EventListItemGrid__EventName-sc-7aonoz-8")
+            a = await card.query_selector("a")
             if not a:
                 continue
             name = (await a.inner_text()).strip()
             href = await a.get_attribute("href")
             eid = _extract_id(href or "")
 
-            # date + time
             date_el = await card.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
             time_el = await card.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
             date_txt = (await date_el.inner_text()).strip() if date_el else None
             time_txt = (await time_el.inner_text()).strip() if time_el else None
             dt_local = _parse_fr_date(date_txt, time_txt)
 
-            # sold "X/Y" -> X
-            sold_el = await card.query_selector("div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1")
-            sold_txt = (await sold_el.inner_text()).strip() if sold_el else ""
-            tickets_sold = _parse_sold(sold_txt)
+            # --- sold robust ---
+            tickets_sold = None
+
+            try:
+                sold_el = await card.query_selector(
+                    "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1"
+                )
+                if sold_el:
+                    txt = (await sold_el.inner_text()).strip()
+                    m = re.search(r"(\d+)\s*/\s*\d+", txt.replace("\xa0", ""))
+                    if m:
+                        tickets_sold = int(m.group(1))
+            except Exception:
+                pass
+
+            if tickets_sold is None:
+                try:
+                    descendants = await card.query_selector_all("*")
+                    for d in descendants:
+                        t = (await d.inner_text()).strip()
+                        if "€" in t:
+                            continue
+                        m = re.search(r"(\d+)\s*/\s*\d+", t.replace("\xa0",""))
+                        if m:
+                            tickets_sold = int(m.group(1))
+                            break
+                except Exception:
+                    pass
+
+            if tickets_sold is None:
+                try:
+                    donut = await card.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
+                    if donut:
+                        t = (await donut.inner_text()).strip()
+                        if t.isdigit():
+                            tickets_sold = int(t)
+                except Exception:
+                    pass
+
+            # debug diag pour 3 premières cartes
+            try:
+                if 'dice_diag_count' not in globals():
+                    global dice_diag_count
+                    dice_diag_count = 0
+                if dice_diag_count < 3:
+                    with open("dice_diag.txt", "a", encoding="utf-8") as f:
+                        f.write(f"[card] name={name!r} date={date_txt!r} time={time_txt!r} sold={tickets_sold!r}\n")
+                    dice_diag_count += 1
+            except Exception:
+                pass
 
             out.append(NormalizedEvent(
                 provider="dice",
@@ -261,6 +226,21 @@ async def run() -> List[NormalizedEvent]:
                 scrape_ts_utc=now,
                 ingestion_run_id=run_id,
             ))
+
+        # dump json preview
+        try:
+            preview = [
+                {
+                    "name": e.event_name,
+                    "dt": e.event_datetime_local.isoformat() if e.event_datetime_local else None,
+                    "sold": e.tickets_sold_total
+                }
+                for e in out[:10]
+            ]
+            with open("dice_events_preview.json", "w", encoding="utf-8") as f:
+                json.dump(preview, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
         await context.close(); await browser.close()
         return out
