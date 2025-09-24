@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://mio.dice.fm"
 LIVE_URL = f"{BASE_URL}/events/live"
-LOGIN_URL = f"{BASE_URL}/login"
+LOGIN_URL = f"{BASE_URL}/auth/login"
 
 # --- utils ---
 
@@ -85,21 +85,91 @@ async def run() -> List[NormalizedEvent]:
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
         )
         page = await context.new_page()
+        # --- login (redirige souvent vers /auth/login) ---
+        # Aller direct sur /auth/login pour éviter les attentes
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-        # --- login (souvent redirection auto depuis /events/live) ---
-        await page.goto(LIVE_URL, wait_until="domcontentloaded")
-        if "login" in page.url:
-            # champs standards
-            email = page.locator('input[type="email"]').first
-            pwd = page.locator('input[type="password"]').first
-            await email.fill(settings.dice_email)
-            await pwd.fill(settings.dice_password)
-            # bouton
-            submit = page.locator('button[type="submit"]').first
-            if await submit.count() == 0:
-                submit = page.get_by_role("button", name=re.compile(r"(se connecter|log in|sign in)", re.I)).first
-            await submit.click()
+        # bouton cookies (si présent)
+        try:
+            btn = page.get_by_role("button", name=re.compile(r"(Accepter|Tout accepter|J.?accepte|Accept all)", re.I))
+            if await btn.is_visible(timeout=2000):
+                await btn.click()
+        except Exception:
+            pass
+
+        # localiser l'input email (placeholder/label/type) — avec fallback
+        async def find_email(frame):
+            locs = [
+                frame.get_by_placeholder(re.compile(r"(e.?mail)", re.I)),
+                frame.get_by_label(re.compile(r"(e.?mail)", re.I)),
+                frame.locator('input[type="email"]')
+            ]
+            for loc in locs:
+                try:
+                    el = loc.first
+                    await el.wait_for(state="visible", timeout=4000)
+                    return el
+                except Exception:
+                    continue
+            return None
+
+        email = await find_email(page)
+        if not email:
+            # certaines versions sont dans un iframe
+            for f in page.frames:
+                if f == page.main_frame: 
+                    continue
+                email = await find_email(f)
+                if email:
+                    page = f
+                    break
+        if not email:
+            # dump pour debug et échouer
+            try:
+                await page.screenshot(path="login_error.png", full_page=True)
+                with open("login_error.html", "w", encoding="utf-8") as f:
+                    f.write(await page.content())
+            except Exception:
+                pass
+            raise RuntimeError("Champ email introuvable sur /auth/login")
+
+        # mot de passe
+        pwd = None
+        for loc in [page.get_by_label(re.compile(r"(mot de passe|password)", re.I)),
+                    page.get_by_placeholder(re.compile(r"(mot de passe|password)", re.I)),
+                    page.locator('input[type="password"]')]:
+            try:
+                el = loc.first
+                await el.wait_for(state="visible", timeout=3000)
+                pwd = el; break
+            except Exception:
+                continue
+        if not pwd:
+            raise RuntimeError("Champ mot de passe introuvable")
+
+        await email.fill(settings.dice_email)
+        await pwd.fill(settings.dice_password)
+
+        # bouton submit
+        submit = None
+        for loc in [page.locator('button[type="submit"]').first,
+                    page.get_by_role("button", name=re.compile(r"(se connecter|log in|sign in)", re.I)).first]:
+            try:
+                await loc.wait_for(state="enabled", timeout=3000)
+                submit = loc; break
+            except Exception:
+                continue
+        if not submit:
+            raise RuntimeError("Bouton de connexion introuvable")
+
+        await submit.click()
+
+        # attendre la redirection vers /events/live
+        try:
             await page.wait_for_url("**/events/live*", timeout=45000)
+        except Exception:
+            # navigation explicite si la redirection n'a pas abouti
+            await page.goto(LIVE_URL, wait_until="domcontentloaded")
 
         # --- events list ---
         # attendre la présence d'au moins une carte
