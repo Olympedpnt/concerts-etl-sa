@@ -80,9 +80,34 @@ async def _collect_cards() -> List[RawShotgunCard]:
         pwd_input = page.locator('input[type="password"]').first
         await pwd_input.fill(settings.shotgun_password)
 
-        # bouton submit
+        # bouton submit (le bouton peut rester disabled tant que le form n'a pas validé)
         submit = page.locator('button[type="submit"]').first
-        await submit.click()
+
+        # Déclenche les validations (blur/tab) sur les champs
+        try:
+            await email_input.press("Tab")
+            await pwd_input.press("Tab")
+        except Exception:
+            pass
+
+        # Attends que le bouton devienne enabled ; sinon "nudge" le champ password
+        try:
+            await submit.wait_for(state="enabled", timeout=8000)
+        except Exception:
+            # Petit "nudge" pour forcer la validation côté UI (AntD)
+            try:
+                await pwd_input.type(" ")
+                await pwd_input.press("Backspace")
+            except Exception:
+                pass
+
+        # Clique si possible, sinon Enter sur le champ mot de passe
+        try:
+            await submit.wait_for(state="enabled", timeout=5000)
+            await submit.click()
+        except Exception:
+            await pwd_input.press("Enter")
+
 
         try:
             await page.wait_for_url(re.compile(r".*/events.*"), timeout=45000)
