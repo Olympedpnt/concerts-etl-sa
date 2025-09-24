@@ -77,36 +77,156 @@ async def run() -> List[NormalizedEvent]:
         )
         page = await context.new_page()
 
-        # --- login ---
+        # --- login (robuste) ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # email
+        # 0) cookies (best-effort)
         try:
-            email = page.get_by_label(re.compile("Email address", re.I)).first
-            await email.wait_for(state="visible", timeout=5000)
+            for txt in [r"Accepter", r"Tout accepter", r"J.?accepte", r"Accept all"]:
+                btn = page.get_by_role("button", name=re.compile(txt, re.I))
+                if await btn.count() and await btn.first.is_visible():
+                    await btn.first.click()
+                    break
         except Exception:
-            email = page.locator('input[type="email"]').first
+            pass
 
-        # password
+        # 1) certains écrans affichent un choix de méthode → cliquer "Sign in with email" / "Continue with email"
         try:
-            pwd = page.get_by_label(re.compile("Password", re.I)).first
-            await pwd.wait_for(state="visible", timeout=5000)
+            for txt in [r"Sign in with email", r"Continue with email", r"Se connecter.*email", r"Continuer.*email"]:
+                b = page.get_by_role("button", name=re.compile(txt, re.I))
+                if await b.count():
+                    await b.first.click()
+                    await page.wait_for_load_state("networkidle")
+                    break
         except Exception:
-            pwd = page.locator('input[type="password"]').first
+            pass
 
+        # 2) helper pour trouver un input par différents moyens + frames
+        async def find_input(selector_list) -> Optional[any]:
+            # cherche d'abord sur la page principale
+            for sel in selector_list:
+                try:
+                    loc = sel if hasattr(sel, "locator") is False else None
+                except Exception:
+                    loc = None
+                # si `sel` est une string CSS
+                target = page.locator(sel).first if isinstance(sel, str) else sel
+                try:
+                    await target.wait_for(state="visible", timeout=3000)
+                    return target
+                except Exception:
+                    continue
+            # sinon, parcourir les iframes visibles
+            for f in page.frames:
+                if f == page.main_frame:
+                    continue
+                for sel in selector_list:
+                    target = f.locator(sel).first if isinstance(sel, str) else sel
+                    try:
+                        await target.wait_for(state="visible", timeout=2000)
+                        return target
+                    except Exception:
+                        continue
+            return None
+
+        # 3) construire les candidats pour email & password
+        email_candidates = [
+            'input[type="email"]',
+            'input[autocomplete="username"]',
+            'input[name="email"]',
+            'input[placeholder="Email address"]',
+            # textbox par nom accessible (role)
+            # (Playwright construit ce locator à l'exécution)
+        ]
+        pwd_candidates = [
+            'input[type="password"]',
+            'input[autocomplete="current-password"]',
+            'input[name="password"]',
+            'input[placeholder="Password"]',
+        ]
+
+        # aussi tenter par rôle/label (selon ton HTML "Email address"/"Password" sont souvent des labels)
+        try:
+            label_email = page.get_by_label(re.compile(r"Email address", re.I)).first
+            await label_email.wait_for(state="visible", timeout=1000)
+            email = label_email
+        except Exception:
+            try:
+                role_email = page.get_by_role("textbox", name=re.compile(r"Email address", re.I)).first
+                await role_email.wait_for(state="visible", timeout=1000)
+                email = role_email
+            except Exception:
+                email = await find_input(email_candidates)
+
+        try:
+            label_pwd = page.get_by_label(re.compile(r"Password", re.I)).first
+            await label_pwd.wait_for(state="visible", timeout=1000)
+            pwd = label_pwd
+        except Exception:
+            try:
+                role_pwd = page.get_by_role("textbox", name=re.compile(r"Password", re.I)).first
+                await role_pwd.wait_for(state="visible", timeout=1000)
+                pwd = role_pwd
+            except Exception:
+                pwd = await find_input(pwd_candidates)
+
+        # dernier fallback: champs texte génériques visibles
+        if email is None:
+            email = await find_input(['input[type="text"]', 'input'])
+        if pwd is None:
+            pwd = await find_input(['input[type="password"]', 'input'])
+
+        if email is None or pwd is None:
+            try:
+                await page.screenshot(path="login_error.png", full_page=True)
+                with open("login_error.html", "w", encoding="utf-8") as f:
+                    f.write(await page.content())
+            except Exception:
+                pass
+            raise RuntimeError("Champs email/password introuvables sur l'écran de login Dice")
+
+        # 4) remplir & soumettre
+        await email.click()
         await email.fill(settings.dice_email)
+        await pwd.click()
         await pwd.fill(settings.dice_password)
 
-        submit = page.locator('button[type="submit"]').first
-        await submit.click()
+        # bouton submit
+        submit = None
+        for loc in [
+            page.locator('button[type="submit"]').first,
+            page.get_by_role("button", name=re.compile(r"^(sign in|se connecter|log in)$", re.I)).first,
+        ]:
+            try:
+                await loc.wait_for(state="visible", timeout=3000)
+                submit = loc
+                break
+            except Exception:
+                continue
 
+        if submit:
+            # certains UIs activent le bouton après blur
+            try:
+                await email.press("Tab")
+                await pwd.press("Tab")
+            except Exception:
+                pass
+            try:
+                await submit.wait_for(state="enabled", timeout=5000)
+                await submit.click()
+            except Exception:
+                await pwd.press("Enter")
+        else:
+            await pwd.press("Enter")
+
+        # 5) aller/attendre la page des events
         try:
             await page.wait_for_url("**/events/live*", timeout=45000)
         except Exception:
             await page.goto(LIVE_URL, wait_until="domcontentloaded")
-
         await page.wait_for_load_state("networkidle")
+
 
         # --- events list ---
         selectors = [
