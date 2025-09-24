@@ -89,6 +89,7 @@ async def run() -> List[NormalizedEvent]:
 
         # --- login ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle")
 
         # cookies (si présents)
         try:
@@ -98,21 +99,65 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
+        # helpers robustes (label -> role -> placeholder -> fallback)
+        async def fill_textbox(name_text: str, secret: str = "", is_password: bool = False):
+            el = None
+            # 1) par LABEL explicite
+            try:
+                el = page.get_by_label(re.compile(fr"^{re.escape(name_text)}$", re.I)).first
+                await el.wait_for(state="visible", timeout=4000)
+            except Exception:
+                el = None
+            # 2) par ROLE textbox avec nom accessible
+            if el is None:
+                try:
+                    el = page.get_by_role("textbox", name=re.compile(fr"^{re.escape(name_text)}$", re.I)).first
+                    await el.wait_for(state="visible", timeout=4000)
+                except Exception:
+                    el = None
+            # 3) par placeholder (au cas où)
+            if el is None:
+                placeholder = "Password" if is_password else "Email address"
+                try:
+                    el = page.locator(f'input[placeholder="{placeholder}"]').first
+                    await el.wait_for(state="visible", timeout=3000)
+                except Exception:
+                    el = None
+            # 4) dernier recours: premier input de type correspondant
+            if el is None:
+                css = 'input[type="password"]' if is_password else 'input[type="text"], input[type="email"]'
+                try:
+                    el = page.locator(css).first
+                    await el.wait_for(state="visible", timeout=3000)
+                except Exception:
+                    el = None
+
+            if el is None:
+                raise RuntimeError(f"Champ {name_text} introuvable")
+
+            await el.click()
+            await el.fill(secret)
+
         try:
-            # champs simples par placeholder
-            email = page.locator('input[placeholder="Email address"]')
-            await email.wait_for(state="visible", timeout=7000)
-            await email.fill(settings.dice_email)
+            await fill_textbox("Email address", settings.dice_email, is_password=False)
+            await fill_textbox("Password", settings.dice_password, is_password=True)
 
-            pwd = page.locator('input[placeholder="Password"]')
-            await pwd.wait_for(state="visible", timeout=7000)
-            await pwd.fill(settings.dice_password)
+            submit = None
+            for loc in [
+                page.locator('button[type="submit"]').first,
+                page.get_by_role("button", name=re.compile(r"^(sign in|se connecter)$", re.I)).first,
+            ]:
+                try:
+                    await loc.wait_for(state="visible", timeout=3000)
+                    submit = loc
+                    break
+                except Exception:
+                    continue
+            if submit is None:
+                raise RuntimeError("Bouton de connexion introuvable")
 
-            submit = page.locator('button[type="submit"]')
-            await submit.wait_for(state="visible", timeout=5000)
             await submit.click()
         except Exception:
-            # dump pour debug et échouer
             try:
                 await page.screenshot(path="login_error.png", full_page=True)
                 with open("login_error.html", "w", encoding="utf-8") as f:
@@ -126,6 +171,7 @@ async def run() -> List[NormalizedEvent]:
             await page.wait_for_url("**/events/live*", timeout=45000)
         except Exception:
             await page.goto(LIVE_URL, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle")
 
         # --- events list ---
         await page.wait_for_selector("div.EventListItemGrid__EventListCard-sc-7aonoz-11", timeout=20000)
