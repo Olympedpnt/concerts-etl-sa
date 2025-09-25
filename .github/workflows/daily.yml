@@ -77,7 +77,7 @@ jobs:
           if-no-files-found: ignore
 
       # --- Dice debug dump (toujours uploader si présent) ---
-      - name: Upload dice debug
+      - name: Upload Dice debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -85,16 +85,13 @@ jobs:
           path: |
             dice_*.html
             dice_*.png
-            dice_events_preview.json
-            dice_cards_count.txt
-            events_error.html
-            events_error.png
+            dice_*.json
+            dice_*.txt
             login_error.html
             login_error.png
-            dice_events_error.html
-            dice_events_error.png
-          if-no-files-found: warn
-          retention-days: 7
+            events_error.html
+            events_error.png
+
 
       - name: List debug files
         if: always()
