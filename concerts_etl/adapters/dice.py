@@ -102,6 +102,15 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
+        # DEBUG: dump après tentative de cliquer "Continue with email"
+        try:
+            await page.screenshot(path="dice_after_continue.png", full_page=True)
+            with open("dice_after_continue.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+        except Exception:
+            pass
+
+
         # 2) helper pour trouver un input par différents moyens + frames
         async def find_input(selector_list) -> Optional[any]:
             # cherche d'abord sur la page principale
@@ -188,6 +197,13 @@ async def run() -> List[NormalizedEvent]:
 
         # 4) remplir & soumettre
         await email.click()
+        # DEBUG : dump avant tentative de remplir email
+        try:
+            await page.screenshot(path="dice_before_email.png", full_page=True)
+            with open("dice_before_email.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+        except Exception:
+            pass
         await email.fill(settings.dice_email)
         await pwd.click()
         await pwd.fill(settings.dice_password)
