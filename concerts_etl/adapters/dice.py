@@ -244,145 +244,110 @@ async def run() -> List[NormalizedEvent]:
         await page.wait_for_load_state("networkidle")
 
 
-        # --- events list ---
-        # on est censé être sur /events/live
-        try:
-            await page.wait_for_url("**/events/live*", timeout=45000)
-        except Exception:
-            await page.goto(LIVE_URL, wait_until="domcontentloaded")
-
-        # 1) attendre l’hydratation React (titres visibles / texte « Événements »)
-        try:
-            await page.wait_for_selector("h1, h2", timeout=15000)
-        except Exception:
-            pass
-        try:
-            await page.wait_for_function(
-                "document.body && (document.body.innerText.includes('Événements') || document.body.innerText.includes('Events'))",
-                timeout=20000
-            )
-        except Exception:
-            pass
+        # --- events list (robuste) ---
+        # assure-toi que nous sommes bien sur /events/live et que la liste est hydratée
+        await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # 2) sélecteurs robustes des cartes (classes React instables → match en 'contient')
-        selectors = [
-            "div[class*='EventListItemGrid__EventListCard']",
-            "div[data-testid='event-list-item']",
-            "tr[data-row-key]",
-            "li[class*='EventListItem']"
-        ]
+        # Attendre qu'au moins un lien d'événement apparaisse (beaucoup plus stable que les classes CSS)
+        await page.wait_for_selector("a[href^='/events/']", timeout=30000)
 
-        found = None
-        for sel in selectors:
-            try:
-                await page.wait_for_selector(sel, timeout=30000)  # 30s pour laisser React charger
-                found = sel
-                break
-            except Exception:
-                continue
+        # dump diagnostic de la page après hydratation
+        try:
+            await page.screenshot(path="dice_events_loaded.png", full_page=True)
+            with open("dice_events_loaded.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+        except Exception:
+            pass
 
-        if not found:
-            # dump debug puis sortie propre (liste vide)
-            try:
-                await page.screenshot(path="events_error.png", full_page=True)
-                with open("events_error.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            log.warning("Aucun événement Dice détecté après hydratation → retour liste vide")
-            await context.close(); await browser.close()
-            return []
-
-        # 3) scroll pour charger suffisamment d'items
+        # scroll pour charger les ~10–20 événements
         async def auto_scroll():
             last = 0
-            for _ in range(10):
+            for _ in range(8):
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(700)
                 h = await page.evaluate("document.body.scrollHeight")
                 if h == last:
                     break
                 last = h
         await auto_scroll()
-        await page.wait_for_timeout(500)  # petite pause de stabilisation
 
-        cards = await page.query_selector_all(found)
-
-
-        # diag: combien de cartes
-        try:
-            with open("dice_cards_count.txt", "w", encoding="utf-8") as f:
-                f.write(str(len(cards)))
-        except Exception:
-            pass
-
+        # Récupère tous les liens d'événement visibles
+        links = await page.query_selector_all("a[href^='/events/']")
+        cards_seen = set()
         out: List[NormalizedEvent] = []
 
-        for card in cards:
-            a = await card.query_selector("a")
-            if not a:
-                continue
-            name = (await a.inner_text()).strip()
+        for a in links:
             href = await a.get_attribute("href")
-            eid = _extract_id(href or "")
+            if not href or "/events/" not in href:
+                continue
 
-            date_el = await card.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
-            time_el = await card.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
+            # remonter au conteneur carte (le plus proche div/li/row contenant)
+            card = await a.evaluate_handle("""
+                (el) => {
+                  let n = el;
+                  for (let i = 0; i < 8 && n; i++) {
+                    if (n.matches && (n.matches("div[data-testid='event-list-item']") ||
+                                      n.matches("div[class*='EventListItemGrid__EventListCard']") ||
+                                      n.matches("li") || n.matches("div"))) return n;
+                    n = n.parentElement;
+                  }
+                  return el.parentElement;
+                }
+            """)
+
+            # éviter de traiter la même carte plusieurs fois
+            cid = await (await card.get_property("outerHTML")).json_value()
+            key = hash(cid)
+            if key in cards_seen:
+                continue
+            cards_seen.add(key)
+
+            # Nom
+            name = (await a.inner_text()).strip()
+
+            # ID provider
+            eid = _extract_id(href)
+
+            # Date / heure (les deux spans existent dans tes captures)
+            date_el = await (await card.as_element()).query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
+            time_el = await (await card.as_element()).query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
             date_txt = (await date_el.inner_text()).strip() if date_el else None
             time_txt = (await time_el.inner_text()).strip() if time_el else None
             dt_local = _parse_fr_date(date_txt, time_txt)
 
-            # --- sold robust ---
+            # Tickets vendus : cherche un motif X/Y n'importe où dans la carte
             tickets_sold = None
+            # 1) zone “Billets”
+            sold_node = await (await card.as_element()).query_selector("div[class*='EventPartSales'] span[class*='EventCardValue__ValuePrimary']")
+            if sold_node:
+                txt = (await sold_node.inner_text()).strip()
+                m = re.search(r"(\d+)\s*/\s*\d+", txt.replace("\xa0",""))
+                if m:
+                    tickets_sold = int(m.group(1))
 
-            try:
-                sold_el = await card.query_selector(
-                    "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1"
-                )
-                if sold_el:
-                    txt = (await sold_el.inner_text()).strip()
-                    m = re.search(r"(\d+)\s*/\s*\d+", txt.replace("\xa0", ""))
-                    if m:
-                        tickets_sold = int(m.group(1))
-            except Exception:
-                pass
-
+            # 2) fallback : scanner tout le texte de la carte
             if tickets_sold is None:
-                try:
-                    descendants = await card.query_selector_all("*")
-                    for d in descendants:
-                        t = (await d.inner_text()).strip()
-                        if "€" in t:
+                texts = await (await card.as_element()).query_selector_all("*")
+                for t in texts:
+                    try:
+                        s = (await t.inner_text()).strip()
+                        if "€" in s:
                             continue
-                        m = re.search(r"(\d+)\s*/\s*\d+", t.replace("\xa0",""))
+                        m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0",""))
                         if m:
                             tickets_sold = int(m.group(1))
                             break
-                except Exception:
-                    pass
+                    except Exception:
+                        continue
 
+            # 3) fallback “donut” (le chiffre au centre)
             if tickets_sold is None:
-                try:
-                    donut = await card.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
-                    if donut:
-                        t = (await donut.inner_text()).strip()
-                        if t.isdigit():
-                            tickets_sold = int(t)
-                except Exception:
-                    pass
-
-            # debug diag pour 3 premières cartes
-            try:
-                if 'dice_diag_count' not in globals():
-                    global dice_diag_count
-                    dice_diag_count = 0
-                if dice_diag_count < 3:
-                    with open("dice_diag.txt", "a", encoding="utf-8") as f:
-                        f.write(f"[card] name={name!r} date={date_txt!r} time={time_txt!r} sold={tickets_sold!r}\n")
-                    dice_diag_count += 1
-            except Exception:
-                pass
+                donut = await (await card.as_element()).query_selector("div[class*='CircleProgress'] span")
+                if donut:
+                    t = (await donut.inner_text()).strip()
+                    if t.isdigit():
+                        tickets_sold = int(t)
 
             out.append(NormalizedEvent(
                 provider="dice",
@@ -401,6 +366,7 @@ async def run() -> List[NormalizedEvent]:
                 scrape_ts_utc=now,
                 ingestion_run_id=run_id,
             ))
+
 
         # dump json preview
         try:
