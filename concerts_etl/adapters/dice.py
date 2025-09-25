@@ -7,6 +7,8 @@ import logging
 import unicodedata
 import json
 import asyncio
+import hashlib
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -68,6 +70,33 @@ def _extract_id(href: str) -> str:
     m = re.search(r"/events/([^/]+)/", href or "")
     return m.group(1) if m else href or ""
 
+# ---------- API dump helpers ----------
+
+DUMP_DIR = Path("dice_api_dump")
+(DUMP_DIR / "responses").mkdir(parents=True, exist_ok=True)
+(DUMP_DIR / "requests").mkdir(parents=True, exist_ok=True)
+
+def _safe_name(url: str) -> str:
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return f"{h}.json"
+
+def _save_text(path: Path, text: str):
+    try:
+        path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+def _save_json_blob(url: str, data: bytes | str):
+    try:
+        if isinstance(data, bytes):
+            try:
+                data = data.decode("utf-8", "replace")
+            except Exception:
+                data = str(data)
+        _save_text(DUMP_DIR / "responses" / _safe_name(url), data)
+    except Exception:
+        pass
+
 # ---------------- main ----------------
 
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
@@ -90,30 +119,52 @@ async def run() -> List[NormalizedEvent]:
         )
         page = await context.new_page()
 
-        # --- CAPTURE RÉSEAU: on stocke TOUTES les réponses JSON pertinentes ---
-        network_payloads: list[dict] = []
+        # --- CAPTURE RÉSEAU: on stocke les réponses JSON pertinentes + bodies des requêtes ---
+        index_entries: list[dict] = []
+
+        def _looks_interesting(url: str, ct: str) -> bool:
+            u = url.lower()
+            return (
+                "application/json" in (ct or "").lower()
+                and any(k in u for k in ["/events", "events?", "/api/", "graphql", "studio", "mio"])
+            )
 
         async def handle_response(resp):
             try:
                 url = resp.url
                 ct = (resp.headers or {}).get("content-type", "")
-                # Large filet : events / graphql / api / mio
-                if "application/json" in ct and any(k in url for k in ["events", "graphql", "api", "mio"]):
+                status = resp.status
+                if _looks_interesting(url, ct):
+                    # index
+                    index_entries.append({"kind": "response", "url": url, "status": status, "ct": ct})
+                    # sauver le corps
                     try:
-                        data = await resp.json()
-                        network_payloads.append({"url": url, "json": data})
+                        body = await resp.body()
+                        _save_json_blob(url, body)
                     except Exception:
-                        # parfois la réponse est du JSON mais parsable qu'en texte
                         try:
-                            text = await resp.text()
-                            network_payloads.append({"url": url, "raw": text[:200000]})
+                            txt = await resp.text()
+                            _save_json_blob(url, txt)
                         except Exception:
-                            network_payloads.append({"url": url, "raw": "<unreadable>"})
+                            pass
             except Exception:
                 pass
 
-        # brancher le hook en tâche asynchrone (pour ne pas bloquer)
+        def handle_request(req):
+            try:
+                url = req.url
+                if any(k in url.lower() for k in ["graphql", "/api/", "/events"]):
+                    body = req.post_data or ""
+                    # index
+                    index_entries.append({"kind": "request", "url": url, "method": req.method, "has_body": bool(body)})
+                    # sauver le POST body (utile pour GraphQL)
+                    if body:
+                        _save_text(DUMP_DIR / "requests" / (_safe_name(url) + ".txt"), body)
+            except Exception:
+                pass
+
         page.on("response", lambda r: asyncio.create_task(handle_response(r)))
+        page.on("request", handle_request)
 
         # --- login (robuste) ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
@@ -271,6 +322,23 @@ async def run() -> List[NormalizedEvent]:
             await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
+        # --- dump storages & cookies (peut contenir des tokens) ---
+        try:
+            storage = await page.evaluate("""
+                () => ({
+                  localStorage: Object.fromEntries(Object.entries(localStorage)),
+                  sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),
+                })
+            """)
+            _save_text(DUMP_DIR / "storage.json", json.dumps(storage, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+        try:
+            ck = await context.cookies()
+            _save_text(DUMP_DIR / "cookies.json", json.dumps(ck, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
         # --- events list (robuste) ---
         await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
@@ -286,7 +354,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # --- SCROLL: scroller le conteneur (ou la fenêtre) pour charger les cartes ---
+        # --- SCROLL: scroller le conteneur (ou la fenêtre) pour charger les cartes + déclencher XHR ---
         async def scroll_container():
             await page.evaluate("""
                 (async () => {
@@ -315,7 +383,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(1200)  # laisse finir les XHR
 
         # --- Récupère les lignes/cartes d'événements (plusieurs variantes) ---
         selectors = [
@@ -383,10 +451,9 @@ async def run() -> List[NormalizedEvent]:
                 pass
             log.warning("Dice: aucun événement trouvé")
 
-            # >>> Dump réseau pour analyse (clé de la piste 1)
+            # Sauvegarde l'index réseau (piste API)
             try:
-                with open("dice_network_dump.json", "w", encoding="utf-8") as f:
-                    json.dump(network_payloads, f, ensure_ascii=False, indent=2)
+                _save_text(DUMP_DIR / "index.json", json.dumps(index_entries, ensure_ascii=False, indent=2))
             except Exception:
                 pass
 
@@ -516,10 +583,9 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # >>> Dump réseau pour analyse (clé de la piste 1) <<<
+        # Sauvegarde l'index réseau (piste API)
         try:
-            with open("dice_network_dump.json", "w", encoding="utf-8") as f:
-                json.dump(network_payloads, f, ensure_ascii=False, indent=2)
+            _save_text(DUMP_DIR / "index.json", json.dumps(index_entries, ensure_ascii=False, indent=2))
         except Exception:
             pass
 
