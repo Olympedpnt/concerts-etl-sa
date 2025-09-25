@@ -6,6 +6,7 @@ import uuid
 import logging
 import unicodedata
 import json
+import asyncio
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -89,17 +90,30 @@ async def run() -> List[NormalizedEvent]:
         )
         page = await context.new_page()
 
-        # --- DEBUG réseau: capter les URLs JSON utiles ---
-        xhr_logs = []
-        def _maybe_save_response(resp):
+        # --- CAPTURE RÉSEAU: on stocke TOUTES les réponses JSON pertinentes ---
+        network_payloads: list[dict] = []
+
+        async def handle_response(resp):
             try:
                 url = resp.url
-                ct = resp.headers.get("content-type", "")
-                if "application/json" in ct and ("/events" in url or "graphql" in url or "api" in url):
-                    xhr_logs.append({"url": url})
+                ct = (resp.headers or {}).get("content-type", "")
+                # Large filet : events / graphql / api / mio
+                if "application/json" in ct and any(k in url for k in ["events", "graphql", "api", "mio"]):
+                    try:
+                        data = await resp.json()
+                        network_payloads.append({"url": url, "json": data})
+                    except Exception:
+                        # parfois la réponse est du JSON mais parsable qu'en texte
+                        try:
+                            text = await resp.text()
+                            network_payloads.append({"url": url, "raw": text[:200000]})
+                        except Exception:
+                            network_payloads.append({"url": url, "raw": "<unreadable>"})
             except Exception:
                 pass
-        page.on("response", _maybe_save_response)
+
+        # brancher le hook en tâche asynchrone (pour ne pas bloquer)
+        page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
         # --- login (robuste) ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
@@ -261,7 +275,7 @@ async def run() -> List[NormalizedEvent]:
         await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # attendre au moins un lien /events/ (hydratation)
+        # attendre qu'au moins un lien d'event existe (hydratation)
         await page.wait_for_selector("a[href^='/events/']", timeout=30000)
 
         # dump de la page hydratée
@@ -272,37 +286,49 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # --- SCROLL: scroller le conteneur (ou à défaut la fenêtre) pour charger les cartes ---
-        try:
+        # --- SCROLL: scroller le conteneur (ou la fenêtre) pour charger les cartes ---
+        async def scroll_container():
             await page.evaluate("""
                 (async () => {
                   const sleep = ms => new Promise(r => setTimeout(r, ms));
                   const pick = (...sels) => sels.map(s=>document.querySelector(s)).find(Boolean);
-                  const scroller = pick('[data-testid="events-list"]','[role="main"]','main','[class*="EventList"]', 'body');
+                  const scroller = pick('[data-testid="events-list"]','main','[role="main"]','[class*="EventListItemGrid"]', 'body');
                   let last = -1, same = 0;
-                  for (let i=0;i<28;i++){
-                    if (scroller && scroller.scrollHeight) scroller.scrollTop = scroller.scrollHeight;
-                    window.scrollBy(0, document.body.scrollHeight); // au cas où
+                  for (let i=0;i<20;i++){
+                    if (!scroller) break;
+                    scroller.scrollTop = scroller.scrollHeight;
+                    window.scrollBy(0, document.body.scrollHeight);
                     await sleep(500);
-                    const h = scroller && scroller.scrollHeight ? scroller.scrollHeight : document.body.scrollHeight;
+                    const h = scroller.scrollHeight;
                     if (h === last) { same++; if (same >= 3) break; } else { same = 0; last = h; }
                   }
                 })();
             """)
+
+        await scroll_container()
+
+        # dump complet
+        try:
+            await page.screenshot(path="dice_full_events.png", full_page=True)
+            with open("dice_full_events.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
         except Exception:
             pass
+
+        await page.wait_for_timeout(800)
 
         # --- Récupère les lignes/cartes d'événements (plusieurs variantes) ---
         selectors = [
             "[data-testid='events-list'] div[data-testid='event-list-item']",
             "div[data-testid='event-list-item']",
             "[data-testid='events-list'] div[class*='EventListItemGrid__EventListCard']",
+            "main div[class*='EventListItemGrid__EventListCard']",
             "div[class*='EventListItemGrid__EventListCard']",
         ]
         rows = []
         for sel in selectors:
             try:
-                await page.wait_for_selector(sel, timeout=15000)
+                await page.wait_for_selector(sel, timeout=12000)
                 rows = await page.query_selector_all(sel)
                 if rows:
                     log.info(f"Dice: trouvé {len(rows)} events avec sélecteur {sel}")
@@ -310,7 +336,7 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 continue
 
-        # --- Fallback: pas de rows ? reconstruire à partir des liens /events/ ---
+        # --- Fallback: reconstruire à partir des liens /events/ ---
         if not rows:
             try:
                 links = await page.query_selector_all("a[href^='/events/']")
@@ -353,15 +379,21 @@ async def run() -> List[NormalizedEvent]:
                 await page.screenshot(path="dice_events_error.png", full_page=True)
                 with open("dice_events_error.html", "w", encoding="utf-8") as f:
                     f.write(await page.content())
-                with open("dice_xhr_urls.json", "w", encoding="utf-8") as f:
-                    json.dump(xhr_logs, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
             log.warning("Dice: aucun événement trouvé")
+
+            # >>> Dump réseau pour analyse (clé de la piste 1)
+            try:
+                with open("dice_network_dump.json", "w", encoding="utf-8") as f:
+                    json.dump(network_payloads, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
             await context.close(); await browser.close()
             return []
 
-        # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + liens /events/ ---
+        # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + tous les liens /events/ ---
         try:
             await page.screenshot(path="dice_events_after_rows.png", full_page=True)
             with open("dice_events_after_rows.html", "w", encoding="utf-8") as f:
@@ -397,24 +429,18 @@ async def run() -> List[NormalizedEvent]:
                 continue
             eid = _extract_id(href)
 
-            # --- date + time (préférer l'attribut title si présent)
+            # --- date + time
             date_el = await row.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
             time_el = await row.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
-
             date_txt = None
             time_txt = None
             if date_el:
-                date_txt = await date_el.get_attribute("title")
-                if not date_txt:
-                    date_txt = (await date_el.inner_text()).strip()
+                date_txt = await date_el.get_attribute("title") or (await date_el.inner_text()).strip()
             if time_el:
-                time_txt = await time_el.get_attribute("title")
-                if not time_txt:
-                    time_txt = (await time_el.inner_text()).strip()
-
+                time_txt = await time_el.get_attribute("title") or (await time_el.inner_text()).strip()
             dt_local = _parse_fr_date(date_txt or "", time_txt or "")
 
-            # --- tickets sold: title="X/Y", sinon texte "X/Y", sinon donut, sinon scan
+            # --- tickets sold
             tickets_sold = None
 
             sold_node = await row.query_selector(
@@ -437,20 +463,20 @@ async def run() -> List[NormalizedEvent]:
                         tickets_sold = int(m.group(1))
 
             if tickets_sold is None:
-                donut = await row.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
-                if donut:
-                    t = (await donut.inner_text()).strip()
-                    if t.isdigit():
-                        tickets_sold = int(t)
-
-            if tickets_sold is None:
                 full = (await row.inner_text()).replace("\xa0", " ")
                 cleaned = " ".join(ln for ln in full.splitlines() if "€" not in ln)
                 m = re.search(r"\b(\d+)\s*/\s*\d+\b", cleaned)
                 if m:
                     tickets_sold = int(m.group(1))
 
-            # --- DEBUG trace compacte
+            if tickets_sold is None:
+                donut = await row.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
+                if donut:
+                    t = (await donut.inner_text()).strip()
+                    if t.isdigit():
+                        tickets_sold = int(t)
+
+            # trace compacte
             try:
                 with open("dice_row_traces.txt", "a", encoding="utf-8") as f:
                     f.write(f"name={name!r} dt={date_txt!r} {time_txt!r} sold={tickets_sold!r} href={href!r}\n")
@@ -490,10 +516,10 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # dump URLs XHR observées (pour passer en mode JSON si besoin)
+        # >>> Dump réseau pour analyse (clé de la piste 1) <<<
         try:
-            with open("dice_xhr_urls.json", "w", encoding="utf-8") as f:
-                json.dump(xhr_logs, f, ensure_ascii=False, indent=2)
+            with open("dice_network_dump.json", "w", encoding="utf-8") as f:
+                json.dump(network_payloads, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
