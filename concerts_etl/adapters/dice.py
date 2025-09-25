@@ -245,31 +245,70 @@ async def run() -> List[NormalizedEvent]:
 
 
         # --- events list ---
+        # on est censé être sur /events/live
+        try:
+            await page.wait_for_url("**/events/live*", timeout=45000)
+        except Exception:
+            await page.goto(LIVE_URL, wait_until="domcontentloaded")
+
+        # 1) attendre l’hydratation React (titres visibles / texte « Événements »)
+        try:
+            await page.wait_for_selector("h1, h2", timeout=15000)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_function(
+                "document.body && (document.body.innerText.includes('Événements') || document.body.innerText.includes('Events'))",
+                timeout=20000
+            )
+        except Exception:
+            pass
+        await page.wait_for_load_state("networkidle")
+
+        # 2) sélecteurs robustes des cartes (classes React instables → match en 'contient')
         selectors = [
             "div[class*='EventListItemGrid__EventListCard']",
-            "div[data-testid='event-list-item']"
+            "div[data-testid='event-list-item']",
+            "tr[data-row-key]",
+            "li[class*='EventListItem']"
         ]
+
         found = None
         for sel in selectors:
             try:
-                await page.wait_for_selector(sel, timeout=15000)
+                await page.wait_for_selector(sel, timeout=30000)  # 30s pour laisser React charger
                 found = sel
                 break
             except Exception:
                 continue
 
         if not found:
+            # dump debug puis sortie propre (liste vide)
             try:
                 await page.screenshot(path="events_error.png", full_page=True)
                 with open("events_error.html", "w", encoding="utf-8") as f:
                     f.write(await page.content())
             except Exception:
                 pass
-            log.warning("Aucun événement Dice détecté → retour liste vide")
+            log.warning("Aucun événement Dice détecté après hydratation → retour liste vide")
             await context.close(); await browser.close()
             return []
 
+        # 3) scroll pour charger suffisamment d'items
+        async def auto_scroll():
+            last = 0
+            for _ in range(10):
+                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(800)
+                h = await page.evaluate("document.body.scrollHeight")
+                if h == last:
+                    break
+                last = h
+        await auto_scroll()
+        await page.wait_for_timeout(500)  # petite pause de stabilisation
+
         cards = await page.query_selector_all(found)
+
 
         # diag: combien de cartes
         try:
