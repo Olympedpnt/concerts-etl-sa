@@ -273,28 +273,40 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # scroll pour charger plus d'items
-        async def auto_scroll():
-            last = 0
-            for _ in range(8):
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(700)
-                h = await page.evaluate("document.body.scrollHeight")
-                if h == last:
-                    break
-                last = h
-        await auto_scroll()
+                # --- SCROLL: scroller le conteneur (pas la fenêtre) pour charger les cartes ---
+        async def scroll_container():
+            await page.evaluate("""
+                (async () => {
+                  const sleep = ms => new Promise(r => setTimeout(r, ms));
+                  const pick = (...sels) => sels.map(s=>document.querySelector(s)).find(Boolean);
+                  const scroller = pick('[data-testid="events-list"]','main','[role="main"]','[class*="EventListItemGrid"]', 'body');
+                  let last = -1, same = 0;
+                  for (let i=0;i<20;i++){
+                    if (!scroller) break;
+                    scroller.scrollTop = scroller.scrollHeight;
+                    window.scrollBy(0, document.body.scrollHeight); // au cas où
+                    await sleep(500);
+                    const h = scroller.scrollHeight;
+                    if (h === last) { same++; if (same >= 3) break; } else { same = 0; last = h; }
+                  }
+                })();
+            """)
 
-        # lignes/cartes d'événements – variantes CSS possibles
+        await scroll_container()
+        await page.wait_for_timeout(800)
+
+        # --- Récupère les lignes/cartes d'événements (plusieurs variantes) ---
         selectors = [
+            "[data-testid='events-list'] div[data-testid='event-list-item']",
             "div[data-testid='event-list-item']",
+            "[data-testid='events-list'] div[class*='EventListItemGrid__EventListCard']",
+            "main div[class*='EventListItemGrid__EventListCard']",
             "div[class*='EventListItemGrid__EventListCard']",
-            "li[data-testid='event-list-item']",
         ]
         rows = []
         for sel in selectors:
             try:
-                await page.wait_for_selector(sel, timeout=15000)
+                await page.wait_for_selector(sel, timeout=12000)
                 rows = await page.query_selector_all(sel)
                 if rows:
                     log.info(f"Dice: trouvé {len(rows)} events avec sélecteur {sel}")
@@ -302,7 +314,47 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 continue
 
+        # --- Fallback: pas de rows ? reconstruire à partir des liens /events/ ---
         if not rows:
+            try:
+                # liens plausibles (hors header) → remonter au parent carte côté DOM
+                links = await page.query_selector_all("a[href^='/events/']")
+                seen = set()
+                for a in links:
+                    href = await a.get_attribute("href") or ""
+                    if "/events/" not in href:
+                        continue
+                    card = await a.evaluate_handle("""
+                        (el) => {
+                          let n = el;
+                          for (let i=0; i<10 && n; i++){
+                            if (n.matches && (
+                                 n.matches("div[data-testid='event-list-item']") ||
+                                 n.matches("div[class*='EventListItemGrid__EventListCard']") ||
+                                 n.matches("li[data-testid='event-list-item']") ||
+                                 n.matches("li") || n.matches("div")
+                               )) return n;
+                            n = n.parentElement;
+                          }
+                          return el.parentElement || el;
+                        }
+                    """)
+                    ce = card.as_element()
+                    if ce:
+                        # dédupliquer par outerHTML hash léger
+                        try:
+                            outer = await ce.evaluate("e => e.outerHTML")
+                            key = hash(outer[:2048])
+                            if key not in seen:
+                                seen.add(key)
+                                rows.append(ce)
+                        except Exception:
+                            rows.append(ce)
+            except Exception:
+                pass
+
+        if not rows:
+            # dumps pour diagnostic
             try:
                 await page.screenshot(path="dice_events_error.png", full_page=True)
                 with open("dice_events_error.html", "w", encoding="utf-8") as f:
@@ -310,7 +362,6 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 pass
             log.warning("Dice: aucun événement trouvé")
-            # dump XHR vus
             try:
                 with open("dice_xhr_urls.json", "w", encoding="utf-8") as f:
                     json.dump(xhr_logs, f, ensure_ascii=False, indent=2)
@@ -318,6 +369,7 @@ async def run() -> List[NormalizedEvent]:
                 pass
             await context.close(); await browser.close()
             return []
+
 
         # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + tous les liens /events/ ---
         try:
