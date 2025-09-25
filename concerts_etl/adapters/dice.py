@@ -1,229 +1,225 @@
 # concerts_etl/adapters/dice.py
 from __future__ import annotations
 
-import re
+import os
 import uuid
-import json
-import hashlib
 import logging
-import unicodedata
-from pathlib import Path
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import List, Optional
 
-from tenacity import retry, wait_exponential, stop_after_attempt
-from playwright.async_api import async_playwright, Response, Request
+from datetime import datetime, timezone
+
+import asyncio
+import httpx
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 from concerts_etl.core.models import NormalizedEvent
 from concerts_etl.core.config import settings
 
 log = logging.getLogger(__name__)
 
-BASE_URL = "https://mio.dice.fm"
-LIVE_URL = f"{BASE_URL}/events/live"
-LOGIN_URL = f"{BASE_URL}/auth/login"
+GRAPHQL_URL = "https://partners-endpoint.dice.fm/graphql"
 
-# ---------------- utils (gardé même si non utilisé ici) ----------------
+# ---------------- helpers ----------------
 
-def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+def _get_token() -> str:
+    # Priorité au settings si tu l'as ajouté, sinon variables d'env
+    token = getattr(settings, "dice_api_token", None) or os.getenv("DICE_API_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "DICE_API_TOKEN manquant. Ajoute-le dans tes secrets/env (ne mets pas le token en dur)."
+        )
+    return token.strip()
 
-# ---------------- capture helpers ----------------
+def _parse_iso(dt: Optional[str]) -> Optional[datetime]:
+    if not dt:
+        return None
+    try:
+        # Les timestamps de l'API sont en ISO8601 (UTC ou tz-aware).
+        d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        # On renvoie en timezone locale inconnue -> garde l'offset reçu
+        return d
+    except Exception:
+        return None
 
-DUMP_DIR = Path("dice_api_dump")
-RESP_DIR = DUMP_DIR / "responses"
-REQ_DIR  = DUMP_DIR / "requests"
+@dataclass
+class DiceEvent:
+    id: str
+    name: Optional[str]
+    start: Optional[datetime]
+    capacity: Optional[int]
+    sold: Optional[int]
 
-def _safe_name(s: str) -> str:
-    # nommage stable et safe basé sur sha1(url+ts)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+# ---------------- GraphQL ----------------
 
-def _ensure_dirs():
-    RESP_DIR.mkdir(parents=True, exist_ok=True)
-    REQ_DIR.mkdir(parents=True, exist_ok=True)
-    (DUMP_DIR / "pages").mkdir(parents=True, exist_ok=True)
+EVENTS_QUERY = """
+query Events($first:Int!, $after:String) {
+  viewer {
+    events(first: $first, after: $after) {
+      pageInfo { endCursor hasNextPage }
+      edges {
+        node {
+          id
+          name
+          startDatetime
+          totalTicketAllocationQty
+          tickets(first: 0) { totalCount }
+        }
+      }
+      totalCount
+    }
+  }
+}
+"""
 
-def _write_text(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
+# Si tu veux calculer un "vendu net" (tickets - returns), on peut activer ce call.
+RETURNS_COUNT_QUERY = """
+query ReturnsCount($eventId: ID!) {
+  viewer {
+    returns(first: 0, where: { eventId: { eq: $eventId } }) {
+      totalCount
+    }
+  }
+}
+"""
 
-def _write_json(path: Path, data) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+class DiceAPIError(Exception):
+    pass
 
-def _looks_interesting(url: str, content_type: str) -> bool:
-    url_l = url.lower()
-    ct_l = (content_type or "").lower()
-    return (
-        "application/json" in ct_l
-        or "/graphql" in url_l
-        or "/api/" in url_l
-        or "/events" in url_l  # souvent présent dans les URLs / params
+@retry(
+    wait=wait_exponential(min=1, max=10),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type((httpx.HTTPError, DiceAPIError)),
+)
+async def _gql(client: httpx.AsyncClient, query: str, variables: dict) -> dict:
+    r = await client.post(
+        GRAPHQL_URL,
+        json={"query": query, "variables": variables},
+        timeout=30,
     )
+    r.raise_for_status()
+    data = r.json()
+    if "errors" in data and data["errors"]:
+        # ne log pas le token ; les erreurs GraphQL n'en contiennent pas
+        raise DiceAPIError(str(data["errors"]))
+    return data["data"]
 
-# ---------------- main (CAPTURE UNIQUEMENT) ----------------
+async def _fetch_events(client: httpx.AsyncClient, page_size: int = 50) -> List[DiceEvent]:
+    events: List[DiceEvent] = []
+    after: Optional[str] = None
+
+    while True:
+        payload = await _gql(client, EVENTS_QUERY, {"first": page_size, "after": after})
+        conn = payload["viewer"]["events"]
+        for edge in conn.get("edges", []):
+            n = edge["node"]
+            ev = DiceEvent(
+                id=n["id"],
+                name=n.get("name"),
+                start=_parse_iso(n.get("startDatetime")),
+                capacity=n.get("totalTicketAllocationQty"),
+                sold=(n.get("tickets") or {}).get("totalCount"),
+            )
+            events.append(ev)
+
+        page = conn.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            break
+        after = page.get("endCursor")
+
+    return events
+
+async def _maybe_returns_count(client: httpx.AsyncClient, event_id: str) -> int:
+    """Optionnel : compte des retours pour obtenir un net sold.
+       Désactivé par défaut pour éviter une requête par event.
+    """
+    try:
+        data = await _gql(client, RETURNS_COUNT_QUERY, {"eventId": event_id})
+        return int((data["viewer"]["returns"] or {}).get("totalCount") or 0)
+    except Exception:
+        return 0
+
+# ---------------- main ----------------
 
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 async def run() -> List[NormalizedEvent]:
-    """
-    Version spéciale : ne parse rien.
-    Objectif : capturer toutes les requêtes/réponses JSON/GraphQL pour analyser l'API.
-    Les fichiers sont écrits dans dice_api_dump/.
-    """
-    _ensure_dirs()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    run_id = str(uuid.uuid4())
 
-    index: list[dict] = []
-    req_bodies: dict[str, str] = {}  # key = req_id (sha1), value = filename
+    token = _get_token()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        context = await browser.new_context(
-            locale="fr-FR",
-            timezone_id="Europe/Paris",
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome Safari"
-            ),
-        )
-        page = await context.new_page()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        # Un UA explicite pour la télémétrie côté DICE si besoin
+        "User-Agent": "concerts-etl/1.0 (+partners-endpoint)",
+    }
 
-        # --- hooks réseau ---
+    out: List[NormalizedEvent] = []
 
-        async def on_request(req: Request):
-            try:
-                ct = req.headers.get("content-type", "")
-                if req.method == "POST" and _looks_interesting(req.url, ct):
-                    body = req.post_data or ""
-                    key = _safe_name(f"{req.url}|{body}")
-                    fn = f"{key}.txt"
-                    _write_text(REQ_DIR / fn, body)
-                    req_bodies[key] = fn
-            except Exception:
-                pass
+    async with httpx.AsyncClient(headers=headers) as client:
+        # 1) Récupère tous les events + sold totalCount
+        events = await _fetch_events(client, page_size=50)
+        log.info(f"Dice API: {len(events)} événements récupérés")
 
-        async def on_response(resp: Response):
-            try:
-                url = resp.url
-                ct = resp.headers.get("content-type", "")
-                if not _looks_interesting(url, ct):
-                    return
+        # 2) Construis les NormalizedEvent
+        #    Si tu veux le "net sold", active la section returns (attention N appels)
+        count_returns = bool(os.getenv("DICE_COUNT_RETURNS", "").strip())
 
-                status = resp.status
-                # filename based on url + status + time
-                raw_id = f"{url}|{status}|{datetime.now(timezone.utc).isoformat()}"
-                key = _safe_name(raw_id)
-                fn = f"{key}.json"
+        async def build(ev: DiceEvent) -> NormalizedEvent:
+            sold = ev.sold
+            if count_returns and ev.id:
+                ret = await _maybe_returns_count(client, ev.id)
+                if sold is not None:
+                    sold = max(0, sold - ret)
 
-                # on essaie JSON, sinon texte brut
-                body_saved_as_json = False
-                try:
-                    data = await resp.json()
-                    _write_json(RESP_DIR / fn, data)
-                    body_saved_as_json = True
-                except Exception:
-                    try:
-                        t = await resp.text()
-                        # si c'est du texte mais JSON-likel, on le sauve en texte
-                        _write_text(RESP_DIR / fn, t[:500_000])  # limite 500KB
-                    except Exception:
-                        _write_text(RESP_DIR / fn, "<unreadable>")
+            return NormalizedEvent(
+                provider="dice",
+                event_id_provider=ev.id,
+                event_name=ev.name or "",
+                city=None,
+                country=None,
+                event_datetime_local=ev.start,
+                timezone=None,  # l'API ne renvoie pas explicitement le tz de l'event
+                status="on sale",  # pas exposé tel quel ici; ajuste si besoin plus tard
+                tickets_sold_total=sold,
+                gross_total=None,
+                net_total=None,
+                currency="EUR",  # facultatif : pas toujours pertinent ici
+                sell_through_pct=None if ev.capacity in (None, 0) or sold is None
+                                     else round(100.0 * sold / max(1, ev.capacity), 2),
+                scrape_ts_utc=now,
+                ingestion_run_id=run_id,
+            )
 
-                # index
-                entry = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "url": url,
-                    "method": resp.request.method,
-                    "status": status,
-                    "content_type": ct,
-                    "response_file": f"responses/{fn}",
-                }
-
-                # essaie de recoller un body de requête si on a la même url + post
-                if resp.request.method == "POST":
-                    try:
-                        body = resp.request.post_data or ""
-                        body_key = _safe_name(f"{url}|{body}")
-                        if body_key in req_bodies:
-                            entry["request_file"] = f"requests/{req_bodies[body_key]}"
-                    except Exception:
-                        pass
-
-                index.append(entry)
-            except Exception:
-                pass
-
-        page.on("request", on_request)
-        page.on("response", on_response)
-
-        # --- LOGIN minimal (page simple avec inputs visibles dans tes captures) ---
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
-
-        # Dump de la page de login pour vérification
-        _write_text(DUMP_DIR / "pages" / "login.html", await page.content())
-
-        # Inputs
-        email = page.locator('input[type="email"]').first
-        password = page.locator('input[type="password"]').first
-        await email.fill(settings.dice_email)
-        await password.fill(settings.dice_password)
-
-        # Submit
-        submit = page.get_by_role("button", name=re.compile(r"sign in", re.I)).first
-        if await submit.count():
-            await submit.click()
+        # parallélise modérément si returns activés
+        if count_returns:
+            sem = asyncio.Semaphore(8)
+            async def _guarded_build(e: DiceEvent):
+                async with sem:
+                    return await build(e)
+            built = await asyncio.gather(*[_guarded_build(e) for e in events])
         else:
-            await password.press("Enter")
+            built = [await build(e) for e in events]
 
-        # Attendre la navigation post-login puis aller sur la liste
-        try:
-            await page.wait_for_url("**/events/**", timeout=45_000)
-        except Exception:
-            pass
+        out.extend(built)
 
-        await page.goto(LIVE_URL, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
-
-        # Dump de la page (même si contenu React vide)
-        _write_text(DUMP_DIR / "pages" / "live_initial.html", await page.content())
-
-        # Laisser respirer/lancer les XHR de la liste (et quelques scrolls doux)
-        try:
-            # petit scroll incrémental pour déclencher les fetchs
-            for _ in range(8):
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(700)
-        except Exception:
-            pass
-
-        await page.wait_for_timeout(2_000)
-        _write_text(DUMP_DIR / "pages" / "live_after_scroll.html", await page.content())
-
-        # Sauvegarder l'état de session (cookies + localStorage)
-        try:
-            storage = await context.storage_state()
-            _write_json(DUMP_DIR / "storage.json", storage)
-        except Exception:
-            pass
-
-        # Sauvegarder un index récapitulatif
-        try:
-            meta = {
-                "generated_at_utc": now,
-                "count_entries": len(index),
-                "base_url": BASE_URL,
-                "live_url": LIVE_URL,
-                "login_url": LOGIN_URL,
+    # Petit aperçu debug (non sensible)
+    try:
+        import json
+        preview = [
+            {
+                "id": e.event_id_provider,
+                "name": e.event_name,
+                "dt": e.event_datetime_local.isoformat() if e.event_datetime_local else None,
+                "sold": e.tickets_sold_total,
+                "capacity": next((ev.capacity for ev in events if ev.id == e.event_id_provider), None),
             }
-            _write_json(DUMP_DIR / "index.json", {"meta": meta, "items": index})
-        except Exception:
-            pass
+            for e in out[:20]
+        ]
+        with open("dice_api_preview.json", "w", encoding="utf-8") as f:
+            json.dump(preview, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-        await context.close()
-        await browser.close()
-
-    # Cette version ne renvoie volontairement aucun event (capture only)
-    # On reviendra la prochaine étape avec un parseur fondé sur les JSON capturés.
-    return []
+    return out
