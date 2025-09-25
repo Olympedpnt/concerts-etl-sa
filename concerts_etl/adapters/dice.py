@@ -261,61 +261,91 @@ async def run() -> List[NormalizedEvent]:
         await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # attendre qu'au moins un lien d'event existe (hydratation)
+        # attendre au moins un lien /events/ (hydratation)
         await page.wait_for_selector("a[href^='/events/']", timeout=30000)
 
-        # cibler explicitement la LISTE CENTRALE (pas la sidebar)
-        list_container = page.locator("main [data-testid='events-list']").first
+        # dump de la page hydratée
         try:
-            await list_container.wait_for(state="visible", timeout=20000)
+            await page.screenshot(path="dice_events_loaded.png", full_page=True)
+            with open("dice_events_loaded.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
         except Exception:
-            # fallback: certains builds utilisent un autre wrapper
-            list_container = page.locator("main").first
-            await list_container.wait_for(state="visible", timeout=20000)
+            pass
 
-        # scroll DU CONTENEUR pour charger les cartes
+        # --- SCROLL: scroller le conteneur (ou à défaut la fenêtre) pour charger les cartes ---
         try:
-            await list_container.evaluate("""
-                (async (root) => {
-                  const sleep = ms => new Promise(r => setTimeout(r, ms));
-                  let last = -1, same = 0;
-                  for (let i=0; i<24; i++){
-                    if (root && root.scrollHeight) root.scrollTop = root.scrollHeight;
-                    window.scrollBy(0, document.body.scrollHeight);
-                    await sleep(500);
-                    const h = root && root.scrollHeight ? root.scrollHeight : document.body.scrollHeight;
-                    if (h === last) { same++; if (same >= 3) break; } else { same = 0; last = h; }
-                  }
-                })
-            """, force_expr=True)
-        except Exception:
-            # si evaluate avec arg n'est pas supporté, fallback global
             await page.evaluate("""
                 (async () => {
                   const sleep = ms => new Promise(r => setTimeout(r, ms));
+                  const pick = (...sels) => sels.map(s=>document.querySelector(s)).find(Boolean);
+                  const scroller = pick('[data-testid="events-list"]','[role="main"]','main','[class*="EventList"]', 'body');
                   let last = -1, same = 0;
-                  for (let i=0; i<24; i++){
-                    window.scrollBy(0, document.body.scrollHeight);
+                  for (let i=0;i<28;i++){
+                    if (scroller && scroller.scrollHeight) scroller.scrollTop = scroller.scrollHeight;
+                    window.scrollBy(0, document.body.scrollHeight); // au cas où
                     await sleep(500);
-                    const h = document.body.scrollHeight;
+                    const h = scroller && scroller.scrollHeight ? scroller.scrollHeight : document.body.scrollHeight;
                     if (h === last) { same++; if (same >= 3) break; } else { same = 0; last = h; }
                   }
                 })();
             """)
-
-        # dump du conteneur
-        try:
-            html_list = await list_container.evaluate("el => el.outerHTML")
-            with open("dice_events_list.html", "w", encoding="utf-8") as f:
-                f.write(html_list)
-            await page.screenshot(path="dice_events_list.png", full_page=True)
         except Exception:
             pass
 
-        # récupérer les lignes/cartes DANS le conteneur UNIQUEMENT
-        rows = await list_container.locator(":scope div[data-testid='event-list-item']").all()
+        # --- Récupère les lignes/cartes d'événements (plusieurs variantes) ---
+        selectors = [
+            "[data-testid='events-list'] div[data-testid='event-list-item']",
+            "div[data-testid='event-list-item']",
+            "[data-testid='events-list'] div[class*='EventListItemGrid__EventListCard']",
+            "div[class*='EventListItemGrid__EventListCard']",
+        ]
+        rows = []
+        for sel in selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=15000)
+                rows = await page.query_selector_all(sel)
+                if rows:
+                    log.info(f"Dice: trouvé {len(rows)} events avec sélecteur {sel}")
+                    break
+            except Exception:
+                continue
+
+        # --- Fallback: pas de rows ? reconstruire à partir des liens /events/ ---
         if not rows:
-            rows = await list_container.locator(":scope div[class*='EventListItemGrid__EventListCard']").all()
+            try:
+                links = await page.query_selector_all("a[href^='/events/']")
+                seen = set()
+                for a in links:
+                    href = await a.get_attribute("href") or ""
+                    if "/events/" not in href:
+                        continue
+                    card = await a.evaluate_handle("""
+                        (el) => {
+                          let n = el;
+                          for (let i=0; i<10 && n; i++){
+                            if (n.matches && (
+                                 n.matches("div[data-testid='event-list-item']") ||
+                                 n.matches("div[class*='EventListItemGrid__EventListCard']") ||
+                                 n.matches("li[data-testid='event-list-item']") ||
+                                 n.matches("li") || n.matches("div")
+                               )) return n;
+                            n = n.parentElement;
+                          }
+                          return el.parentElement || el;
+                        }
+                    """)
+                    ce = card.as_element()
+                    if ce:
+                        try:
+                            outer = await ce.evaluate("e => e.outerHTML")
+                            key = hash(outer[:2048])
+                            if key not in seen:
+                                seen.add(key)
+                                rows.append(ce)
+                        except Exception:
+                            rows.append(ce)
+            except Exception:
+                pass
 
         if not rows:
             # dumps pour diagnostic
@@ -327,11 +357,11 @@ async def run() -> List[NormalizedEvent]:
                     json.dump(xhr_logs, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
-            log.warning("Dice: aucun événement trouvé DANS le conteneur principal")
+            log.warning("Dice: aucun événement trouvé")
             await context.close(); await browser.close()
             return []
 
-        # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + tous les liens /events/ ---
+        # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + liens /events/ ---
         try:
             await page.screenshot(path="dice_events_after_rows.png", full_page=True)
             with open("dice_events_after_rows.html", "w", encoding="utf-8") as f:
@@ -354,7 +384,7 @@ async def run() -> List[NormalizedEvent]:
         out: List[NormalizedEvent] = []
 
         for row in rows:
-            # --- name + href/id (dans la carte)
+            # --- name + href/id
             link = await row.query_selector("a.EventListItemGrid__EventName-sc-7aonoz-8")
             if not link:
                 link = await row.query_selector("a[href^='/events/']")
@@ -367,7 +397,7 @@ async def run() -> List[NormalizedEvent]:
                 continue
             eid = _extract_id(href)
 
-            # --- date + time (spans; privilégier l'attribut title si présent)
+            # --- date + time (préférer l'attribut title si présent)
             date_el = await row.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
             time_el = await row.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
 
@@ -381,12 +411,12 @@ async def run() -> List[NormalizedEvent]:
                 time_txt = await time_el.get_attribute("title")
                 if not time_txt:
                     time_txt = (await time_el.inner_text()).strip()
+
             dt_local = _parse_fr_date(date_txt or "", time_txt or "")
 
             # --- tickets sold: title="X/Y", sinon texte "X/Y", sinon donut, sinon scan
             tickets_sold = None
 
-            # 1) zone ventes avec title="X/Y"
             sold_node = await row.query_selector(
                 "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1[title*='/']"
             )
@@ -396,7 +426,6 @@ async def run() -> List[NormalizedEvent]:
                 if m:
                     tickets_sold = int(m.group(1))
 
-            # 2) fallback: même span via texte visible "X/Y"
             if tickets_sold is None:
                 sold_el2 = await row.query_selector(
                     "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1"
@@ -407,7 +436,6 @@ async def run() -> List[NormalizedEvent]:
                     if m:
                         tickets_sold = int(m.group(1))
 
-            # 3) donut au centre
             if tickets_sold is None:
                 donut = await row.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
                 if donut:
@@ -415,7 +443,6 @@ async def run() -> List[NormalizedEvent]:
                     if t.isdigit():
                         tickets_sold = int(t)
 
-            # 4) scan du texte de la carte (hors montants €)
             if tickets_sold is None:
                 full = (await row.inner_text()).replace("\xa0", " ")
                 cleaned = " ".join(ln for ln in full.splitlines() if "€" not in ln)
