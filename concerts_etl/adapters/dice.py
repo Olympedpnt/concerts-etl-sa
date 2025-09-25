@@ -461,6 +461,20 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 pass
 
+            # --- DEBUG : dump brut des 5 premières cartes ---
+            try:
+                if 'dice_debug_count' not in globals():
+                    global dice_debug_count
+                    dice_debug_count = 0
+                if dice_debug_count < 5:
+                    txt = (await row.inner_text()).replace("\xa0", " ")
+                    with open("dice_card_debug.txt", "a", encoding="utf-8") as f:
+                        f.write(f"\n=== CARD #{dice_debug_count+1} ===\n{txt}\n")
+                    dice_debug_count += 1
+            except Exception as e:
+                log.warning(f"DEBUG dump card failed: {e}")
+
+
             out.append(NormalizedEvent(
                 provider="dice",
                 event_id_provider=eid,
