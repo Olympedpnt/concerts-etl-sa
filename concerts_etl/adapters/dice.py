@@ -283,7 +283,7 @@ async def run() -> List[NormalizedEvent]:
                 continue
 
             # remonter au conteneur carte (le plus proche div/li/row contenant)
-            card = await a.evaluate_handle("""
+            card_js = await a.evaluate_handle("""
                 (el) => {
                   let n = el;
                   for (let i = 0; i < 8 && n; i++) {
@@ -295,13 +295,19 @@ async def run() -> List[NormalizedEvent]:
                   return el.parentElement;
                 }
             """)
+            card_el = card_js.as_element()
+            if not card_el:
+                continue  # sécurité : pas d'ElementHandle
 
-            # éviter de traiter la même carte plusieurs fois
-            cid = await (await card.get_property("outerHTML")).json_value()
-            key = hash(cid)
-            if key in cards_seen:
-                continue
-            cards_seen.add(key)
+            # éviter de traiter la même carte plusieurs fois (hash de l'outerHTML)
+            try:
+                outer = await card_el.evaluate("e => e.outerHTML")
+                key = hash(outer)
+                if key in cards_seen:
+                    continue
+                cards_seen.add(key)
+            except Exception:
+                pass
 
             # Nom
             name = (await a.inner_text()).strip()
@@ -309,45 +315,52 @@ async def run() -> List[NormalizedEvent]:
             # ID provider
             eid = _extract_id(href)
 
-            # Date / heure (les deux spans existent dans tes captures)
-            date_el = await (await card.as_element()).query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
-            time_el = await (await card.as_element()).query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
+            # Date / heure
+            date_el = await card_el.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
+            time_el = await card_el.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
             date_txt = (await date_el.inner_text()).strip() if date_el else None
             time_txt = (await time_el.inner_text()).strip() if time_el else None
             dt_local = _parse_fr_date(date_txt, time_txt)
 
             # Tickets vendus : cherche un motif X/Y n'importe où dans la carte
             tickets_sold = None
+
             # 1) zone “Billets”
-            sold_node = await (await card.as_element()).query_selector("div[class*='EventPartSales'] span[class*='EventCardValue__ValuePrimary']")
-            if sold_node:
-                txt = (await sold_node.inner_text()).strip()
-                m = re.search(r"(\d+)\s*/\s*\d+", txt.replace("\xa0",""))
-                if m:
-                    tickets_sold = int(m.group(1))
+            try:
+                sold_node = await card_el.query_selector("div[class*='EventPartSales'] span[class*='EventCardValue__ValuePrimary']")
+                if sold_node:
+                    txt = (await sold_node.inner_text()).strip()
+                    m = re.search(r"(\d+)\s*/\s*\d+", txt.replace("\xa0",""))
+                    if m:
+                        tickets_sold = int(m.group(1))
+            except Exception:
+                pass
 
             # 2) fallback : scanner tout le texte de la carte
             if tickets_sold is None:
-                texts = await (await card.as_element()).query_selector_all("*")
-                for t in texts:
-                    try:
-                        s = (await t.inner_text()).strip()
-                        if "€" in s:
+                try:
+                    nodes = await card_el.query_selector_all("*")
+                    for n in nodes:
+                        s = (await n.inner_text()).strip()
+                        if not s or "€" in s:
                             continue
                         m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0",""))
                         if m:
                             tickets_sold = int(m.group(1))
                             break
-                    except Exception:
-                        continue
+                except Exception:
+                    pass
 
-            # 3) fallback “donut” (le chiffre au centre)
+            # 3) fallback “donut”
             if tickets_sold is None:
-                donut = await (await card.as_element()).query_selector("div[class*='CircleProgress'] span")
-                if donut:
-                    t = (await donut.inner_text()).strip()
-                    if t.isdigit():
-                        tickets_sold = int(t)
+                try:
+                    donut = await card_el.query_selector("div[class*='CircleProgress'] span")
+                    if donut:
+                        t = (await donut.inner_text()).strip()
+                        if t.isdigit():
+                            tickets_sold = int(t)
+                except Exception:
+                    pass
 
             out.append(NormalizedEvent(
                 provider="dice",
@@ -366,6 +379,7 @@ async def run() -> List[NormalizedEvent]:
                 scrape_ts_utc=now,
                 ingestion_run_id=run_id,
             ))
+
 
 
         # dump json preview
