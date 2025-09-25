@@ -402,78 +402,86 @@ async def run() -> List[NormalizedEvent]:
         out: List[NormalizedEvent] = []
 
         for row in rows:
-            # lien évènement dans la ligne
-            link = await row.query_selector("a[href^='/events/']")
+            # --- name + href/id
+            link = await row.query_selector("a.EventListItemGrid__EventName-sc-7aonoz-8")
+            if not link:
+                # fallback: premier <a> descendant
+                link = await row.query_selector("a[href^='/events/']")
             if not link:
                 continue
 
             name = (await link.inner_text()).strip()
-            href = await link.get_attribute("href") or ""
+            href = (await link.get_attribute("href")) or ""
             if "/events/" not in href:
                 continue
             eid = _extract_id(href)
 
-            # Date / heure : via attributes title (stables dans tes captures)
-            date_el = await row.query_selector("span[title][class*='EventCardValue__ValuePrimary']")
-            time_el = await row.query_selector("span[title][class*='EventCardValue__ValueSecondary']")
+            # --- date + time (spans avec title dans tes dumps)
+            date_el = await row.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1[title]")
+            time_el = await row.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2[title]")
             date_txt = (await date_el.get_attribute("title")) if date_el else None
             time_txt = (await time_el.get_attribute("title")) if time_el else None
+
+            # fallback si pas de title: lire le texte visible
+            if not date_txt:
+                date_txt = (await row.eval_on_selector(
+                    "span.EventCardValue__ValuePrimary-sc-14o65za-1",
+                    "el => el?.textContent?.trim() || null"
+                )) or None
+            if not time_txt:
+                time_txt = (await row.eval_on_selector(
+                    "span.EventCardValue__ValueSecondary-sc-14o65za-2",
+                    "el => el?.textContent?.trim() || null"
+                )) or None
+
             dt_local = _parse_fr_date(date_txt or "", time_txt or "")
 
-            # Tickets vendus : title="X/Y" si présent
+            # --- tickets sold: priorité au title="X/Y", sinon texte "X/Y", sinon donut
             tickets_sold = None
-            try:
-                sold_span = await row.query_selector("span[title*='/']")
-                if sold_span:
-                    s = (await sold_span.get_attribute("title")) or ""
-                    m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0", ""))
+
+            # 1) zone ventes avec title="X/Y"
+            sold_node = await row.query_selector(
+                "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1[title*='/']"
+            )
+            if sold_node:
+                s = (await sold_node.get_attribute("title")) or ""
+                m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0",""))
+                if m:
+                    tickets_sold = int(m.group(1))
+
+            # 2) fallback: même span mais via texte visible "X/Y"
+            if tickets_sold is None:
+                sold_txt = await row.eval_on_selector(
+                    "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1",
+                    "el => el?.textContent?.trim() || ''"
+                )
+                if sold_txt:
+                    m = re.search(r"(\d+)\s*/\s*\d+", sold_txt.replace("\xa0",""))
                     if m:
                         tickets_sold = int(m.group(1))
-            except Exception:
-                pass
 
-            # Fallback : scanner le texte (sans montants €)
+            # 3) dernier fallback: scanner la carte (hors montants €)
             if tickets_sold is None:
-                try:
-                    full = (await row.inner_text()).replace("\xa0", " ")
-                    cleaned = " ".join(ln for ln in full.splitlines() if "€" not in ln)
-                    m = re.search(r"\b(\d+)\s*/\s*\d+\b", cleaned)
-                    if m:
-                        tickets_sold = int(m.group(1))
-                except Exception:
-                    pass
+                full = (await row.inner_text()).replace("\xa0", " ")
+                cleaned = " ".join(ln for ln in full.splitlines() if "€" not in ln)
+                m = re.search(r"\b(\d+)\s*/\s*\d+\b", cleaned)
+                if m:
+                    tickets_sold = int(m.group(1))
 
-            # Fallback donut : chiffre au centre
+            # 4) donut (chiffre centré) si toujours rien
             if tickets_sold is None:
-                try:
-                    donut = await row.query_selector("div[class*='CircleProgress'] span")
-                    if donut:
-                        t = (await donut.inner_text()).strip()
-                        if t.isdigit():
-                            tickets_sold = int(t)
-                except Exception:
-                    pass
+                donut = await row.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
+                if donut:
+                    t = (await donut.inner_text()).strip()
+                    if t.isdigit():
+                        tickets_sold = int(t)
 
-            # DEBUG: trace compacte par ligne
+            # --- DEBUG trace compacte
             try:
                 with open("dice_row_traces.txt", "a", encoding="utf-8") as f:
                     f.write(f"name={name!r} dt={date_txt!r} {time_txt!r} sold={tickets_sold!r} href={href!r}\n")
             except Exception:
                 pass
-
-            # --- DEBUG : dump brut des 5 premières cartes ---
-            try:
-                if 'dice_debug_count' not in globals():
-                    global dice_debug_count
-                    dice_debug_count = 0
-                if dice_debug_count < 5:
-                    txt = (await row.inner_text()).replace("\xa0", " ")
-                    with open("dice_card_debug.txt", "a", encoding="utf-8") as f:
-                        f.write(f"\n=== CARD #{dice_debug_count+1} ===\n{txt}\n")
-                    dice_debug_count += 1
-            except Exception as e:
-                log.warning(f"DEBUG dump card failed: {e}")
-
 
             out.append(NormalizedEvent(
                 provider="dice",
@@ -492,6 +500,7 @@ async def run() -> List[NormalizedEvent]:
                 scrape_ts_utc=now,
                 ingestion_run_id=run_id,
             ))
+
 
         # preview JSON
         try:
