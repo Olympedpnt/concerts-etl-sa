@@ -417,24 +417,23 @@ async def run() -> List[NormalizedEvent]:
             eid = _extract_id(href)
 
             # --- date + time (spans avec title dans tes dumps)
-            date_el = await row.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1[title]")
-            time_el = await row.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2[title]")
-            date_txt = (await date_el.get_attribute("title")) if date_el else None
-            time_txt = (await time_el.get_attribute("title")) if time_el else None
+            date_el = await row.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
+            time_el = await row.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
 
-            # fallback si pas de title: lire le texte visible
-            if not date_txt:
-                date_txt = (await row.eval_on_selector(
-                    "span.EventCardValue__ValuePrimary-sc-14o65za-1",
-                    "el => el?.textContent?.trim() || null"
-                )) or None
-            if not time_txt:
-                time_txt = (await row.eval_on_selector(
-                    "span.EventCardValue__ValueSecondary-sc-14o65za-2",
-                    "el => el?.textContent?.trim() || null"
-                )) or None
+            date_txt = None
+            time_txt = None
+
+            if date_el:
+                date_txt = await date_el.get_attribute("title")
+                if not date_txt:
+                    date_txt = (await date_el.inner_text()).strip()
+            if time_el:
+                time_txt = await time_el.get_attribute("title")
+                if not time_txt:
+                    time_txt = (await time_el.inner_text()).strip()
 
             dt_local = _parse_fr_date(date_txt or "", time_txt or "")
+
 
             # --- tickets sold: priorité au title="X/Y", sinon texte "X/Y", sinon donut
             tickets_sold = None
@@ -451,11 +450,11 @@ async def run() -> List[NormalizedEvent]:
 
             # 2) fallback: même span mais via texte visible "X/Y"
             if tickets_sold is None:
-                sold_txt = await row.eval_on_selector(
-                    "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1",
-                    "el => el?.textContent?.trim() || ''"
+                sold_el2 = await row.query_selector(
+                    "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1"
                 )
-                if sold_txt:
+                if sold_el2:
+                    sold_txt = (await sold_el2.inner_text()) or ""
                     m = re.search(r"(\d+)\s*/\s*\d+", sold_txt.replace("\xa0",""))
                     if m:
                         tickets_sold = int(m.group(1))
