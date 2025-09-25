@@ -293,6 +293,14 @@ async def run() -> List[NormalizedEvent]:
             """)
 
         await scroll_container()
+        # --- dump complet pour debug ---
+        try:
+            await page.screenshot(path="dice_full_events.png", full_page=True)
+            with open("dice_full_events.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+        except Exception:
+            pass
+
         await page.wait_for_timeout(800)
 
         # --- Récupère les lignes/cartes d'événements (plusieurs variantes) ---
