@@ -3,17 +3,16 @@ from __future__ import annotations
 
 import re
 import uuid
+import json
+import hashlib
 import logging
 import unicodedata
-import json
-import asyncio
-import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from tenacity import retry, wait_exponential, stop_after_attempt
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Response, Request
 
 from concerts_etl.core.models import NormalizedEvent
 from concerts_etl.core.config import settings
@@ -24,85 +23,56 @@ BASE_URL = "https://mio.dice.fm"
 LIVE_URL = f"{BASE_URL}/events/live"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# ---------------- utils ----------------
+# ---------------- utils (gardé même si non utilisé ici) ----------------
 
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
-MONTHS = {
-    "janv": 1, "jan": 1,
-    "fevr": 2, "févr": 2, "fev": 2, "fe": 2,
-    "mars": 3, "mar": 3,
-    "avr": 4, "avril": 4,
-    "mai": 5,
-    "juin": 6,
-    "juil": 7,
-    "aout": 8, "août": 8,
-    "sept": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12, "déc": 12,
-}
-
-def _parse_fr_date(date_text: str, time_text: str) -> Optional[datetime]:
-    # ex: "ven. 10 oct. 2025", "19:30"
-    if not date_text or not time_text:
-        return None
-    s = _strip_accents(date_text.lower()).replace(".", " ")
-    m = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", s)
-    if not m:
-        return None
-    day, mon_key, year = int(m.group(1)), m.group(2)[:4], int(m.group(3))
-    month = MONTHS.get(mon_key)
-    if not month:
-        return None
-    tm = re.match(r"(\d{1,2}):(\d{2})", time_text.strip())
-    if not tm:
-        return None
-    hh, mm = int(tm.group(1)), int(tm.group(2))
-    try:
-        return datetime(year, month, day, hh, mm)
-    except Exception:
-        return None
-
-def _extract_id(href: str) -> str:
-    # /events/RXZlbnQ6NDk2NDE3/overview -> RXZlbnQ6NDk2NDE3
-    m = re.search(r"/events/([^/]+)/", href or "")
-    return m.group(1) if m else href or ""
-
-# ---------- API dump helpers ----------
+# ---------------- capture helpers ----------------
 
 DUMP_DIR = Path("dice_api_dump")
-(DUMP_DIR / "responses").mkdir(parents=True, exist_ok=True)
-(DUMP_DIR / "requests").mkdir(parents=True, exist_ok=True)
+RESP_DIR = DUMP_DIR / "responses"
+REQ_DIR  = DUMP_DIR / "requests"
 
-def _safe_name(url: str) -> str:
-    h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-    return f"{h}.json"
+def _safe_name(s: str) -> str:
+    # nommage stable et safe basé sur sha1(url+ts)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-def _save_text(path: Path, text: str):
-    try:
-        path.write_text(text, encoding="utf-8")
-    except Exception:
-        pass
+def _ensure_dirs():
+    RESP_DIR.mkdir(parents=True, exist_ok=True)
+    REQ_DIR.mkdir(parents=True, exist_ok=True)
+    (DUMP_DIR / "pages").mkdir(parents=True, exist_ok=True)
 
-def _save_json_blob(url: str, data: bytes | str):
-    try:
-        if isinstance(data, bytes):
-            try:
-                data = data.decode("utf-8", "replace")
-            except Exception:
-                data = str(data)
-        _save_text(DUMP_DIR / "responses" / _safe_name(url), data)
-    except Exception:
-        pass
+def _write_text(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
 
-# ---------------- main ----------------
+def _write_json(path: Path, data) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _looks_interesting(url: str, content_type: str) -> bool:
+    url_l = url.lower()
+    ct_l = (content_type or "").lower()
+    return (
+        "application/json" in ct_l
+        or "/graphql" in url_l
+        or "/api/" in url_l
+        or "/events" in url_l  # souvent présent dans les URLs / params
+    )
+
+# ---------------- main (CAPTURE UNIQUEMENT) ----------------
 
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 async def run() -> List[NormalizedEvent]:
-    now = datetime.now(timezone.utc)
-    run_id = str(uuid.uuid4())
+    """
+    Version spéciale : ne parse rien.
+    Objectif : capturer toutes les requêtes/réponses JSON/GraphQL pour analyser l'API.
+    Les fichiers sont écrits dans dice_api_dump/.
+    """
+    _ensure_dirs()
+    now = datetime.now(timezone.utc).isoformat()
+
+    index: list[dict] = []
+    req_bodies: dict[str, str] = {}  # key = req_id (sha1), value = filename
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -119,475 +89,141 @@ async def run() -> List[NormalizedEvent]:
         )
         page = await context.new_page()
 
-        # --- CAPTURE RÉSEAU: on stocke les réponses JSON pertinentes + bodies des requêtes ---
-        index_entries: list[dict] = []
+        # --- hooks réseau ---
 
-        def _looks_interesting(url: str, ct: str) -> bool:
-            u = url.lower()
-            return (
-                "application/json" in (ct or "").lower()
-                and any(k in u for k in ["/events", "events?", "/api/", "graphql", "studio", "mio"])
-            )
+        async def on_request(req: Request):
+            try:
+                ct = req.headers.get("content-type", "")
+                if req.method == "POST" and _looks_interesting(req.url, ct):
+                    body = req.post_data or ""
+                    key = _safe_name(f"{req.url}|{body}")
+                    fn = f"{key}.txt"
+                    _write_text(REQ_DIR / fn, body)
+                    req_bodies[key] = fn
+            except Exception:
+                pass
 
-        async def handle_response(resp):
+        async def on_response(resp: Response):
             try:
                 url = resp.url
-                ct = (resp.headers or {}).get("content-type", "")
+                ct = resp.headers.get("content-type", "")
+                if not _looks_interesting(url, ct):
+                    return
+
                 status = resp.status
-                if _looks_interesting(url, ct):
-                    # index
-                    index_entries.append({"kind": "response", "url": url, "status": status, "ct": ct})
-                    # sauver le corps
+                # filename based on url + status + time
+                raw_id = f"{url}|{status}|{datetime.now(timezone.utc).isoformat()}"
+                key = _safe_name(raw_id)
+                fn = f"{key}.json"
+
+                # on essaie JSON, sinon texte brut
+                body_saved_as_json = False
+                try:
+                    data = await resp.json()
+                    _write_json(RESP_DIR / fn, data)
+                    body_saved_as_json = True
+                except Exception:
                     try:
-                        body = await resp.body()
-                        _save_json_blob(url, body)
+                        t = await resp.text()
+                        # si c'est du texte mais JSON-likel, on le sauve en texte
+                        _write_text(RESP_DIR / fn, t[:500_000])  # limite 500KB
                     except Exception:
-                        try:
-                            txt = await resp.text()
-                            _save_json_blob(url, txt)
-                        except Exception:
-                            pass
+                        _write_text(RESP_DIR / fn, "<unreadable>")
+
+                # index
+                entry = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "url": url,
+                    "method": resp.request.method,
+                    "status": status,
+                    "content_type": ct,
+                    "response_file": f"responses/{fn}",
+                }
+
+                # essaie de recoller un body de requête si on a la même url + post
+                if resp.request.method == "POST":
+                    try:
+                        body = resp.request.post_data or ""
+                        body_key = _safe_name(f"{url}|{body}")
+                        if body_key in req_bodies:
+                            entry["request_file"] = f"requests/{req_bodies[body_key]}"
+                    except Exception:
+                        pass
+
+                index.append(entry)
             except Exception:
                 pass
 
-        def handle_request(req):
-            try:
-                url = req.url
-                if any(k in url.lower() for k in ["graphql", "/api/", "/events"]):
-                    body = req.post_data or ""
-                    # index
-                    index_entries.append({"kind": "request", "url": url, "method": req.method, "has_body": bool(body)})
-                    # sauver le POST body (utile pour GraphQL)
-                    if body:
-                        _save_text(DUMP_DIR / "requests" / (_safe_name(url) + ".txt"), body)
-            except Exception:
-                pass
+        page.on("request", on_request)
+        page.on("response", on_response)
 
-        page.on("response", lambda r: asyncio.create_task(handle_response(r)))
-        page.on("request", handle_request)
-
-        # --- login (robuste) ---
+        # --- LOGIN minimal (page simple avec inputs visibles dans tes captures) ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # cookies (best-effort)
-        try:
-            for txt in [r"Accepter", r"Tout accepter", r"J.?accepte", r"Accept all"]:
-                btn = page.get_by_role("button", name=re.compile(txt, re.I))
-                if await btn.count() and await btn.first.is_visible():
-                    await btn.first.click()
-                    break
-        except Exception:
-            pass
+        # Dump de la page de login pour vérification
+        _write_text(DUMP_DIR / "pages" / "login.html", await page.content())
 
-        # choix méthode : "Sign in with email" / "Continue with email"
-        try:
-            for txt in [r"Sign in with email", r"Continue with email", r"Se connecter.*email", r"Continuer.*email"]:
-                b = page.get_by_role("button", name=re.compile(txt, re.I))
-                if await b.count():
-                    await b.first.click()
-                    await page.wait_for_load_state("networkidle")
-                    break
-        except Exception:
-            pass
-
-        # dump après "continue with email"
-        try:
-            await page.screenshot(path="dice_after_continue.png", full_page=True)
-            with open("dice_after_continue.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-        except Exception:
-            pass
-
-        # helper: trouver input via plusieurs techniques (+ iframes)
-        async def find_input(selector_list) -> Optional[any]:
-            # page principale
-            for sel in selector_list:
-                target = page.locator(sel).first if isinstance(sel, str) else sel
-                try:
-                    await target.wait_for(state="visible", timeout=3000)
-                    return target
-                except Exception:
-                    continue
-            # iframes
-            for f in page.frames:
-                if f == page.main_frame:
-                    continue
-                for sel in selector_list:
-                    target = f.locator(sel).first if isinstance(sel, str) else sel
-                    try:
-                        await target.wait_for(state="visible", timeout=2000)
-                        return target
-                    except Exception:
-                        continue
-            return None
-
-        email_candidates = [
-            'input[type="email"]',
-            'input[autocomplete="username"]',
-            'input[name="email"]',
-            'input[placeholder="Email address"]',
-        ]
-        pwd_candidates = [
-            'input[type="password"]',
-            'input[autocomplete="current-password"]',
-            'input[name="password"]',
-            'input[placeholder="Password"]',
-        ]
-
-        # par label/role, puis fallback
-        email = None
-        try:
-            label_email = page.get_by_label(re.compile(r"Email address", re.I)).first
-            await label_email.wait_for(state="visible", timeout=1000)
-            email = label_email
-        except Exception:
-            try:
-                role_email = page.get_by_role("textbox", name=re.compile(r"Email address", re.I)).first
-                await role_email.wait_for(state="visible", timeout=1000)
-                email = role_email
-            except Exception:
-                email = await find_input(email_candidates)
-
-        pwd = None
-        try:
-            label_pwd = page.get_by_label(re.compile(r"Password", re.I)).first
-            await label_pwd.wait_for(state="visible", timeout=1000)
-            pwd = label_pwd
-        except Exception:
-            try:
-                role_pwd = page.get_by_role("textbox", name=re.compile(r"Password", re.I)).first
-                await role_pwd.wait_for(state="visible", timeout=1000)
-                pwd = role_pwd
-            except Exception:
-                pwd = await find_input(pwd_candidates)
-
-        # derniers fallbacks
-        if email is None:
-            email = await find_input(['input[type="text"]', 'input'])
-        if pwd is None:
-            pwd = await find_input(['input[type="password"]', 'input'])
-
-        if email is None or pwd is None:
-            try:
-                await page.screenshot(path="login_error.png", full_page=True)
-                with open("login_error.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            raise RuntimeError("Champs email/password introuvables sur l'écran de login Dice")
-
-        # remplir & soumettre
-        await email.click()
-        try:
-            await page.screenshot(path="dice_before_email.png", full_page=True)
-            with open("dice_before_email.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-        except Exception:
-            pass
+        # Inputs
+        email = page.locator('input[type="email"]').first
+        password = page.locator('input[type="password"]').first
         await email.fill(settings.dice_email)
-        await pwd.click()
-        await pwd.fill(settings.dice_password)
+        await password.fill(settings.dice_password)
 
-        submit = None
-        for loc in [
-            page.locator('button[type="submit"]').first,
-            page.get_by_role("button", name=re.compile(r"^(sign in|se connecter|log in)$", re.I)).first,
-        ]:
-            try:
-                await loc.wait_for(state="visible", timeout=3000)
-                submit = loc
-                break
-            except Exception:
-                continue
-
-        if submit:
-            try:
-                await email.press("Tab")
-                await pwd.press("Tab")
-            except Exception:
-                pass
-            try:
-                await submit.wait_for(state="enabled", timeout=5000)
-                await submit.click()
-            except Exception:
-                await pwd.press("Enter")
+        # Submit
+        submit = page.get_by_role("button", name=re.compile(r"sign in", re.I)).first
+        if await submit.count():
+            await submit.click()
         else:
-            await pwd.press("Enter")
+            await password.press("Enter")
 
-        # aller/attendre la page des events
+        # Attendre la navigation post-login puis aller sur la liste
         try:
-            await page.wait_for_url("**/events/live*", timeout=45000)
-        except Exception:
-            await page.goto(LIVE_URL, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
-
-        # --- dump storages & cookies (peut contenir des tokens) ---
-        try:
-            storage = await page.evaluate("""
-                () => ({
-                  localStorage: Object.fromEntries(Object.entries(localStorage)),
-                  sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),
-                })
-            """)
-            _save_text(DUMP_DIR / "storage.json", json.dumps(storage, ensure_ascii=False, indent=2))
-        except Exception:
-            pass
-        try:
-            ck = await context.cookies()
-            _save_text(DUMP_DIR / "cookies.json", json.dumps(ck, ensure_ascii=False, indent=2))
+            await page.wait_for_url("**/events/**", timeout=45_000)
         except Exception:
             pass
 
-        # --- events list (robuste) ---
         await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # attendre qu'au moins un lien d'event existe (hydratation)
-        await page.wait_for_selector("a[href^='/events/']", timeout=30000)
+        # Dump de la page (même si contenu React vide)
+        _write_text(DUMP_DIR / "pages" / "live_initial.html", await page.content())
 
-        # dump de la page hydratée
+        # Laisser respirer/lancer les XHR de la liste (et quelques scrolls doux)
         try:
-            await page.screenshot(path="dice_events_loaded.png", full_page=True)
-            with open("dice_events_loaded.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
+            # petit scroll incrémental pour déclencher les fetchs
+            for _ in range(8):
+                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(700)
         except Exception:
             pass
 
-        # --- SCROLL: scroller le conteneur (ou la fenêtre) pour charger les cartes + déclencher XHR ---
-        async def scroll_container():
-            await page.evaluate("""
-                (async () => {
-                  const sleep = ms => new Promise(r => setTimeout(r, ms));
-                  const pick = (...sels) => sels.map(s=>document.querySelector(s)).find(Boolean);
-                  const scroller = pick('[data-testid="events-list"]','main','[role="main"]','[class*="EventListItemGrid"]', 'body');
-                  let last = -1, same = 0;
-                  for (let i=0;i<20;i++){
-                    if (!scroller) break;
-                    scroller.scrollTop = scroller.scrollHeight;
-                    window.scrollBy(0, document.body.scrollHeight);
-                    await sleep(500);
-                    const h = scroller.scrollHeight;
-                    if (h === last) { same++; if (same >= 3) break; } else { same = 0; last = h; }
-                  }
-                })();
-            """)
+        await page.wait_for_timeout(2_000)
+        _write_text(DUMP_DIR / "pages" / "live_after_scroll.html", await page.content())
 
-        await scroll_container()
-
-        # dump complet
+        # Sauvegarder l'état de session (cookies + localStorage)
         try:
-            await page.screenshot(path="dice_full_events.png", full_page=True)
-            with open("dice_full_events.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
+            storage = await context.storage_state()
+            _write_json(DUMP_DIR / "storage.json", storage)
         except Exception:
             pass
 
-        await page.wait_for_timeout(1200)  # laisse finir les XHR
-
-        # --- Récupère les lignes/cartes d'événements (plusieurs variantes) ---
-        selectors = [
-            "[data-testid='events-list'] div[data-testid='event-list-item']",
-            "div[data-testid='event-list-item']",
-            "[data-testid='events-list'] div[class*='EventListItemGrid__EventListCard']",
-            "main div[class*='EventListItemGrid__EventListCard']",
-            "div[class*='EventListItemGrid__EventListCard']",
-        ]
-        rows = []
-        for sel in selectors:
-            try:
-                await page.wait_for_selector(sel, timeout=12000)
-                rows = await page.query_selector_all(sel)
-                if rows:
-                    log.info(f"Dice: trouvé {len(rows)} events avec sélecteur {sel}")
-                    break
-            except Exception:
-                continue
-
-        # --- Fallback: reconstruire à partir des liens /events/ ---
-        if not rows:
-            try:
-                links = await page.query_selector_all("a[href^='/events/']")
-                seen = set()
-                for a in links:
-                    href = await a.get_attribute("href") or ""
-                    if "/events/" not in href:
-                        continue
-                    card = await a.evaluate_handle("""
-                        (el) => {
-                          let n = el;
-                          for (let i=0; i<10 && n; i++){
-                            if (n.matches && (
-                                 n.matches("div[data-testid='event-list-item']") ||
-                                 n.matches("div[class*='EventListItemGrid__EventListCard']") ||
-                                 n.matches("li[data-testid='event-list-item']") ||
-                                 n.matches("li") || n.matches("div")
-                               )) return n;
-                            n = n.parentElement;
-                          }
-                          return el.parentElement || el;
-                        }
-                    """)
-                    ce = card.as_element()
-                    if ce:
-                        try:
-                            outer = await ce.evaluate("e => e.outerHTML")
-                            key = hash(outer[:2048])
-                            if key not in seen:
-                                seen.add(key)
-                                rows.append(ce)
-                        except Exception:
-                            rows.append(ce)
-            except Exception:
-                pass
-
-        if not rows:
-            # dumps pour diagnostic
-            try:
-                await page.screenshot(path="dice_events_error.png", full_page=True)
-                with open("dice_events_error.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            log.warning("Dice: aucun événement trouvé")
-
-            # Sauvegarde l'index réseau (piste API)
-            try:
-                _save_text(DUMP_DIR / "index.json", json.dumps(index_entries, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
-
-            await context.close(); await browser.close()
-            return []
-
-        # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + tous les liens /events/ ---
+        # Sauvegarder un index récapitulatif
         try:
-            await page.screenshot(path="dice_events_after_rows.png", full_page=True)
-            with open("dice_events_after_rows.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            sample_html = await rows[0].evaluate("e => e.outerHTML")
-            sample_text = await rows[0].evaluate("e => e.innerText")
-            with open("dice_card_sample.html", "w", encoding="utf-8") as f:
-                f.write(sample_html)
-            with open("dice_card_sample.txt", "w", encoding="utf-8") as f:
-                f.write(sample_text)
-            links_all = await page.eval_on_selector_all(
-                "a[href^='/events/']",
-                "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText}))"
-            )
-            with open("dice_links.json", "w", encoding="utf-8") as f:
-                json.dump(links_all, f, ensure_ascii=False, indent=2)
+            meta = {
+                "generated_at_utc": now,
+                "count_entries": len(index),
+                "base_url": BASE_URL,
+                "live_url": LIVE_URL,
+                "login_url": LOGIN_URL,
+            }
+            _write_json(DUMP_DIR / "index.json", {"meta": meta, "items": index})
         except Exception:
             pass
 
-        out: List[NormalizedEvent] = []
+        await context.close()
+        await browser.close()
 
-        for row in rows:
-            # --- name + href/id
-            link = await row.query_selector("a.EventListItemGrid__EventName-sc-7aonoz-8")
-            if not link:
-                link = await row.query_selector("a[href^='/events/']")
-            if not link:
-                continue
-
-            name = (await link.inner_text()).strip()
-            href = (await link.get_attribute("href")) or ""
-            if "/events/" not in href:
-                continue
-            eid = _extract_id(href)
-
-            # --- date + time
-            date_el = await row.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
-            time_el = await row.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
-            date_txt = None
-            time_txt = None
-            if date_el:
-                date_txt = await date_el.get_attribute("title") or (await date_el.inner_text()).strip()
-            if time_el:
-                time_txt = await time_el.get_attribute("title") or (await time_el.inner_text()).strip()
-            dt_local = _parse_fr_date(date_txt or "", time_txt or "")
-
-            # --- tickets sold
-            tickets_sold = None
-
-            sold_node = await row.query_selector(
-                "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1[title*='/']"
-            )
-            if sold_node:
-                s = (await sold_node.get_attribute("title")) or ""
-                m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0",""))
-                if m:
-                    tickets_sold = int(m.group(1))
-
-            if tickets_sold is None:
-                sold_el2 = await row.query_selector(
-                    "div.EventPartSales__SalesWrapper-sc-khilk2-0 span.EventCardValue__ValuePrimary-sc-14o65za-1"
-                )
-                if sold_el2:
-                    sold_txt = (await sold_el2.inner_text()) or ""
-                    m = re.search(r"(\d+)\s*/\s*\d+", sold_txt.replace("\xa0",""))
-                    if m:
-                        tickets_sold = int(m.group(1))
-
-            if tickets_sold is None:
-                full = (await row.inner_text()).replace("\xa0", " ")
-                cleaned = " ".join(ln for ln in full.splitlines() if "€" not in ln)
-                m = re.search(r"\b(\d+)\s*/\s*\d+\b", cleaned)
-                if m:
-                    tickets_sold = int(m.group(1))
-
-            if tickets_sold is None:
-                donut = await row.query_selector("div.CircleProgress__CircleProgressControl-sc-ac4mpo-0 span")
-                if donut:
-                    t = (await donut.inner_text()).strip()
-                    if t.isdigit():
-                        tickets_sold = int(t)
-
-            # trace compacte
-            try:
-                with open("dice_row_traces.txt", "a", encoding="utf-8") as f:
-                    f.write(f"name={name!r} dt={date_txt!r} {time_txt!r} sold={tickets_sold!r} href={href!r}\n")
-            except Exception:
-                pass
-
-            out.append(NormalizedEvent(
-                provider="dice",
-                event_id_provider=eid,
-                event_name=name,
-                city=None,
-                country=None,
-                event_datetime_local=dt_local,
-                timezone="Europe/Paris",
-                status="on sale",
-                tickets_sold_total=tickets_sold,
-                gross_total=None,
-                net_total=None,
-                currency="EUR",
-                sell_through_pct=None,
-                scrape_ts_utc=now,
-                ingestion_run_id=run_id,
-            ))
-
-        # preview JSON
-        try:
-            preview = [
-                {
-                    "name": e.event_name,
-                    "dt": e.event_datetime_local.isoformat() if e.event_datetime_local else None,
-                    "sold": e.tickets_sold_total,
-                }
-                for e in out[:10]
-            ]
-            with open("dice_events_preview.json", "w", encoding="utf-8") as f:
-                json.dump(preview, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-        # Sauvegarde l'index réseau (piste API)
-        try:
-            _save_text(DUMP_DIR / "index.json", json.dumps(index_entries, ensure_ascii=False, indent=2))
-        except Exception:
-            pass
-
-        await context.close(); await browser.close()
-        return out
+    # Cette version ne renvoie volontairement aucun event (capture only)
+    # On reviendra la prochaine étape avec un parseur fondé sur les JSON capturés.
+    return []
