@@ -39,7 +39,7 @@ jobs:
           echo "Python $(python --version)"
           ls -lh $GOOGLE_APPLICATION_CREDENTIALS || true
           head -n 5 $GOOGLE_APPLICATION_CREDENTIALS || true
-
+       
       # --- Run ETL ---
       - name: Run ETL
         env:
@@ -47,12 +47,23 @@ jobs:
           SHOTGUN_PASSWORD: ${{ secrets.SHOTGUN_PASSWORD }}
           DICE_EMAIL: ${{ secrets.DICE_EMAIL }}
           DICE_PASSWORD: ${{ secrets.DICE_PASSWORD }}
+          DICE_API_TOKEN: ${{ secrets.DICE_API_TOKEN }}   # ⬅️ NEW
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_DOC_TITLE: "Concerts Pointages"
           GSHEET_WORKSHEET: "shotgun_events"
           GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
         run: |
           python -m concerts_etl run
+
+      - name: Upload Dice API dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dice-api-dump
+          path: |
+            dice_api_dump
+            dice_network_dump.json
+          if-no-files-found: ignore
 
       # --- Debug login (si échec login) ---
       - name: Upload login debug
