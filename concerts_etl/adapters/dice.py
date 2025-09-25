@@ -1,9 +1,17 @@
+# concerts_etl/adapters/dice.py
 from __future__ import annotations
-import re, uuid, logging, unicodedata, json
+
+import re
+import uuid
+import logging
+import unicodedata
+import json
 from datetime import datetime, timezone
 from typing import List, Optional
+
 from tenacity import retry, wait_exponential, stop_after_attempt
 from playwright.async_api import async_playwright
+
 from concerts_etl.core.models import NormalizedEvent
 from concerts_etl.core.config import settings
 
@@ -13,7 +21,7 @@ BASE_URL = "https://mio.dice.fm"
 LIVE_URL = f"{BASE_URL}/events/live"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# --- utils ---
+# ---------------- utils ----------------
 
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
@@ -30,10 +38,11 @@ MONTHS = {
     "sept": 9,
     "oct": 10,
     "nov": 11,
-    "dec": 12, "déc": 12
+    "dec": 12, "déc": 12,
 }
 
 def _parse_fr_date(date_text: str, time_text: str) -> Optional[datetime]:
+    # ex: "ven. 10 oct. 2025", "19:30"
     if not date_text or not time_text:
         return None
     s = _strip_accents(date_text.lower()).replace(".", " ")
@@ -54,10 +63,11 @@ def _parse_fr_date(date_text: str, time_text: str) -> Optional[datetime]:
         return None
 
 def _extract_id(href: str) -> str:
+    # /events/RXZlbnQ6NDk2NDE3/overview -> RXZlbnQ6NDk2NDE3
     m = re.search(r"/events/([^/]+)/", href or "")
     return m.group(1) if m else href or ""
 
-# --- main ---
+# ---------------- main ----------------
 
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 async def run() -> List[NormalizedEvent]:
@@ -72,16 +82,31 @@ async def run() -> List[NormalizedEvent]:
         context = await browser.new_context(
             locale="fr-FR",
             timezone_id="Europe/Paris",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome Safari"
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome Safari"
+            ),
         )
         page = await context.new_page()
+
+        # --- DEBUG réseau: capter les URLs JSON utiles ---
+        xhr_logs = []
+        def _maybe_save_response(resp):
+            try:
+                url = resp.url
+                ct = resp.headers.get("content-type", "")
+                if "application/json" in ct and ("/events" in url or "graphql" in url or "api" in url):
+                    xhr_logs.append({"url": url})
+            except Exception:
+                pass
+
+        page.on("response", _maybe_save_response)
 
         # --- login (robuste) ---
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # 0) cookies (best-effort)
+        # cookies (best-effort)
         try:
             for txt in [r"Accepter", r"Tout accepter", r"J.?accepte", r"Accept all"]:
                 btn = page.get_by_role("button", name=re.compile(txt, re.I))
@@ -91,7 +116,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # 1) certains écrans affichent un choix de méthode → cliquer "Sign in with email" / "Continue with email"
+        # choix méthode : "Sign in with email" / "Continue with email"
         try:
             for txt in [r"Sign in with email", r"Continue with email", r"Se connecter.*email", r"Continuer.*email"]:
                 b = page.get_by_role("button", name=re.compile(txt, re.I))
@@ -102,7 +127,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # DEBUG: dump après tentative de cliquer "Continue with email"
+        # dump après "continue with email"
         try:
             await page.screenshot(path="dice_after_continue.png", full_page=True)
             with open("dice_after_continue.html", "w", encoding="utf-8") as f:
@@ -110,23 +135,17 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-
-        # 2) helper pour trouver un input par différents moyens + frames
+        # helper: trouver input via plusieurs techniques (+ iframes)
         async def find_input(selector_list) -> Optional[any]:
-            # cherche d'abord sur la page principale
+            # page principale
             for sel in selector_list:
-                try:
-                    loc = sel if hasattr(sel, "locator") is False else None
-                except Exception:
-                    loc = None
-                # si `sel` est une string CSS
                 target = page.locator(sel).first if isinstance(sel, str) else sel
                 try:
                     await target.wait_for(state="visible", timeout=3000)
                     return target
                 except Exception:
                     continue
-            # sinon, parcourir les iframes visibles
+            # iframes
             for f in page.frames:
                 if f == page.main_frame:
                     continue
@@ -139,14 +158,11 @@ async def run() -> List[NormalizedEvent]:
                         continue
             return None
 
-        # 3) construire les candidats pour email & password
         email_candidates = [
             'input[type="email"]',
             'input[autocomplete="username"]',
             'input[name="email"]',
             'input[placeholder="Email address"]',
-            # textbox par nom accessible (role)
-            # (Playwright construit ce locator à l'exécution)
         ]
         pwd_candidates = [
             'input[type="password"]',
@@ -155,7 +171,8 @@ async def run() -> List[NormalizedEvent]:
             'input[placeholder="Password"]',
         ]
 
-        # aussi tenter par rôle/label (selon ton HTML "Email address"/"Password" sont souvent des labels)
+        # par label/role, puis fallback
+        email = None
         try:
             label_email = page.get_by_label(re.compile(r"Email address", re.I)).first
             await label_email.wait_for(state="visible", timeout=1000)
@@ -168,6 +185,7 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 email = await find_input(email_candidates)
 
+        pwd = None
         try:
             label_pwd = page.get_by_label(re.compile(r"Password", re.I)).first
             await label_pwd.wait_for(state="visible", timeout=1000)
@@ -180,7 +198,7 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 pwd = await find_input(pwd_candidates)
 
-        # dernier fallback: champs texte génériques visibles
+        # derniers fallbacks
         if email is None:
             email = await find_input(['input[type="text"]', 'input'])
         if pwd is None:
@@ -195,9 +213,8 @@ async def run() -> List[NormalizedEvent]:
                 pass
             raise RuntimeError("Champs email/password introuvables sur l'écran de login Dice")
 
-        # 4) remplir & soumettre
+        # remplir & soumettre
         await email.click()
-        # DEBUG : dump avant tentative de remplir email
         try:
             await page.screenshot(path="dice_before_email.png", full_page=True)
             with open("dice_before_email.html", "w", encoding="utf-8") as f:
@@ -208,7 +225,6 @@ async def run() -> List[NormalizedEvent]:
         await pwd.click()
         await pwd.fill(settings.dice_password)
 
-        # bouton submit
         submit = None
         for loc in [
             page.locator('button[type="submit"]').first,
@@ -222,7 +238,6 @@ async def run() -> List[NormalizedEvent]:
                 continue
 
         if submit:
-            # certains UIs activent le bouton après blur
             try:
                 await email.press("Tab")
                 await pwd.press("Tab")
@@ -236,23 +251,21 @@ async def run() -> List[NormalizedEvent]:
         else:
             await pwd.press("Enter")
 
-        # 5) aller/attendre la page des events
+        # aller/attendre la page des events
         try:
             await page.wait_for_url("**/events/live*", timeout=45000)
         except Exception:
             await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-
         # --- events list (robuste) ---
-        # assure-toi que nous sommes bien sur /events/live et que la liste est hydratée
         await page.goto(LIVE_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # Attendre qu'au moins un lien d'événement apparaisse (beaucoup plus stable que les classes CSS)
+        # attendre qu'au moins un lien d'event existe (hydratation)
         await page.wait_for_selector("a[href^='/events/']", timeout=30000)
 
-        # dump diagnostic de la page après hydratation
+        # dump de la page hydratée
         try:
             await page.screenshot(path="dice_events_loaded.png", full_page=True)
             with open("dice_events_loaded.html", "w", encoding="utf-8") as f:
@@ -260,7 +273,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
-        # scroll pour charger les ~10–20 événements
+        # scroll pour charger plus d'items
         async def auto_scroll():
             last = 0
             for _ in range(8):
@@ -272,16 +285,67 @@ async def run() -> List[NormalizedEvent]:
                 last = h
         await auto_scroll()
 
-        # Récupère toutes les LIGNES d'événements (pas les liens du header/menus)
-        await page.wait_for_selector("div[data-testid='event-list-item']", timeout=30000)
-        rows = await page.query_selector_all("div[data-testid='event-list-item']")
+        # lignes/cartes d'événements – variantes CSS possibles
+        selectors = [
+            "div[data-testid='event-list-item']",
+            "div[class*='EventListItemGrid__EventListCard']",
+            "li[data-testid='event-list-item']",
+        ]
+        rows = []
+        for sel in selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=15000)
+                rows = await page.query_selector_all(sel)
+                if rows:
+                    log.info(f"Dice: trouvé {len(rows)} events avec sélecteur {sel}")
+                    break
+            except Exception:
+                continue
+
+        if not rows:
+            try:
+                await page.screenshot(path="dice_events_error.png", full_page=True)
+                with open("dice_events_error.html", "w", encoding="utf-8") as f:
+                    f.write(await page.content())
+            except Exception:
+                pass
+            log.warning("Dice: aucun événement trouvé")
+            # dump XHR vus
+            try:
+                with open("dice_xhr_urls.json", "w", encoding="utf-8") as f:
+                    json.dump(xhr_logs, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            await context.close(); await browser.close()
+            return []
+
+        # --- DEBUG PACK: échantillon de page & 1ʳᵉ carte + tous les liens /events/ ---
+        try:
+            await page.screenshot(path="dice_events_after_rows.png", full_page=True)
+            with open("dice_events_after_rows.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+            sample_html = await rows[0].evaluate("e => e.outerHTML")
+            sample_text = await rows[0].evaluate("e => e.innerText")
+            with open("dice_card_sample.html", "w", encoding="utf-8") as f:
+                f.write(sample_html)
+            with open("dice_card_sample.txt", "w", encoding="utf-8") as f:
+                f.write(sample_text)
+            links_all = await page.eval_on_selector_all(
+                "a[href^='/events/']",
+                "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText}))"
+            )
+            with open("dice_links.json", "w", encoding="utf-8") as f:
+                json.dump(links_all, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
         out: List[NormalizedEvent] = []
 
         for row in rows:
             # lien évènement dans la ligne
             link = await row.query_selector("a[href^='/events/']")
             if not link:
-                continue  # ligne sans event
+                continue
 
             name = (await link.inner_text()).strip()
             href = await link.get_attribute("href") or ""
@@ -289,14 +353,14 @@ async def run() -> List[NormalizedEvent]:
                 continue
             eid = _extract_id(href)
 
-            # Date / heure : spans avec title
+            # Date / heure : via attributes title (stables dans tes captures)
             date_el = await row.query_selector("span[title][class*='EventCardValue__ValuePrimary']")
             time_el = await row.query_selector("span[title][class*='EventCardValue__ValueSecondary']")
             date_txt = (await date_el.get_attribute("title")) if date_el else None
             time_txt = (await time_el.get_attribute("title")) if time_el else None
             dt_local = _parse_fr_date(date_txt or "", time_txt or "")
 
-            # Tickets vendus : d'abord un span title="X/Y"
+            # Tickets vendus : title="X/Y" si présent
             tickets_sold = None
             try:
                 sold_span = await row.query_selector("span[title*='/']")
@@ -308,7 +372,7 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 pass
 
-            # Fallback : scanner le texte de la ligne (hors montants €)
+            # Fallback : scanner le texte (sans montants €)
             if tickets_sold is None:
                 try:
                     full = (await row.inner_text()).replace("\xa0", " ")
@@ -330,6 +394,13 @@ async def run() -> List[NormalizedEvent]:
                 except Exception:
                     pass
 
+            # DEBUG: trace compacte par ligne
+            try:
+                with open("dice_row_traces.txt", "a", encoding="utf-8") as f:
+                    f.write(f"name={name!r} dt={date_txt!r} {time_txt!r} sold={tickets_sold!r} href={href!r}\n")
+            except Exception:
+                pass
+
             out.append(NormalizedEvent(
                 provider="dice",
                 event_id_provider=eid,
@@ -348,20 +419,25 @@ async def run() -> List[NormalizedEvent]:
                 ingestion_run_id=run_id,
             ))
 
-
-
-        # dump json preview
+        # preview JSON
         try:
             preview = [
                 {
                     "name": e.event_name,
                     "dt": e.event_datetime_local.isoformat() if e.event_datetime_local else None,
-                    "sold": e.tickets_sold_total
+                    "sold": e.tickets_sold_total,
                 }
                 for e in out[:10]
             ]
             with open("dice_events_preview.json", "w", encoding="utf-8") as f:
                 json.dump(preview, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        # dump URLs XHR observées (pour passer en mode JSON si besoin)
+        try:
+            with open("dice_xhr_urls.json", "w", encoding="utf-8") as f:
+                json.dump(xhr_logs, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
