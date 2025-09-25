@@ -76,18 +76,33 @@ jobs:
             events_empty.png
           if-no-files-found: ignore
 
-      - name: Upload Dice debug
+      # --- Dice debug dump (toujours uploader si présent) ---
+      - name: Upload dice debug
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dice-debug
           path: |
-            dice_cards_count.txt
-            dice_diag.txt
+            dice_*.html
+            dice_*.png
             dice_events_preview.json
+            dice_cards_count.txt
             events_error.html
             events_error.png
-          if-no-files-found: ignore
+            login_error.html
+            login_error.png
+            dice_events_error.html
+            dice_events_error.png
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: List debug files
+        if: always()
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          ls -la *.html || true
+          ls -la *.png  || true
 
       - name: Upload providers preview
         if: always()
