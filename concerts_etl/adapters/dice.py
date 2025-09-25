@@ -272,89 +272,57 @@ async def run() -> List[NormalizedEvent]:
                 last = h
         await auto_scroll()
 
-        # Récupère tous les liens d'événement visibles
-        links = await page.query_selector_all("a[href^='/events/']")
-        cards_seen = set()
+        # Récupère toutes les LIGNES d'événements (pas les liens du header/menus)
+        await page.wait_for_selector("div[data-testid='event-list-item']", timeout=30000)
+        rows = await page.query_selector_all("div[data-testid='event-list-item']")
         out: List[NormalizedEvent] = []
 
-        for a in links:
-            href = await a.get_attribute("href")
-            if not href or "/events/" not in href:
+        for row in rows:
+            # lien évènement dans la ligne
+            link = await row.query_selector("a[href^='/events/']")
+            if not link:
+                continue  # ligne sans event
+
+            name = (await link.inner_text()).strip()
+            href = await link.get_attribute("href") or ""
+            if "/events/" not in href:
                 continue
-
-            # remonter au conteneur carte (le plus proche div/li/row contenant)
-            card_js = await a.evaluate_handle("""
-                (el) => {
-                  let n = el;
-                  for (let i = 0; i < 8 && n; i++) {
-                    if (n.matches && (n.matches("div[data-testid='event-list-item']") ||
-                                      n.matches("div[class*='EventListItemGrid__EventListCard']") ||
-                                      n.matches("li") || n.matches("div"))) return n;
-                    n = n.parentElement;
-                  }
-                  return el.parentElement;
-                }
-            """)
-            card_el = card_js.as_element()
-            if not card_el:
-                continue  # sécurité : pas d'ElementHandle
-
-            # éviter de traiter la même carte plusieurs fois (hash de l'outerHTML)
-            try:
-                outer = await card_el.evaluate("e => e.outerHTML")
-                key = hash(outer)
-                if key in cards_seen:
-                    continue
-                cards_seen.add(key)
-            except Exception:
-                pass
-
-            # Nom
-            name = (await a.inner_text()).strip()
-
-            # ID provider
             eid = _extract_id(href)
 
-            # Date / heure
-            date_el = await card_el.query_selector("span.EventCardValue__ValuePrimary-sc-14o65za-1")
-            time_el = await card_el.query_selector("span.EventCardValue__ValueSecondary-sc-14o65za-2")
-            date_txt = (await date_el.inner_text()).strip() if date_el else None
-            time_txt = (await time_el.inner_text()).strip() if time_el else None
-            dt_local = _parse_fr_date(date_txt, time_txt)
+            # Date / heure : spans avec title
+            date_el = await row.query_selector("span[title][class*='EventCardValue__ValuePrimary']")
+            time_el = await row.query_selector("span[title][class*='EventCardValue__ValueSecondary']")
+            date_txt = (await date_el.get_attribute("title")) if date_el else None
+            time_txt = (await time_el.get_attribute("title")) if time_el else None
+            dt_local = _parse_fr_date(date_txt or "", time_txt or "")
 
-            # Tickets vendus : cherche un motif X/Y n'importe où dans la carte
+            # Tickets vendus : d'abord un span title="X/Y"
             tickets_sold = None
-
-            # 1) zone “Billets”
             try:
-                sold_node = await card_el.query_selector("div[class*='EventPartSales'] span[class*='EventCardValue__ValuePrimary']")
-                if sold_node:
-                    txt = (await sold_node.inner_text()).strip()
-                    m = re.search(r"(\d+)\s*/\s*\d+", txt.replace("\xa0",""))
+                sold_span = await row.query_selector("span[title*='/']")
+                if sold_span:
+                    s = (await sold_span.get_attribute("title")) or ""
+                    m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0", ""))
                     if m:
                         tickets_sold = int(m.group(1))
             except Exception:
                 pass
 
-            # 2) fallback : scanner tout le texte de la carte
+            # Fallback : scanner le texte de la ligne (hors montants €)
             if tickets_sold is None:
                 try:
-                    nodes = await card_el.query_selector_all("*")
-                    for n in nodes:
-                        s = (await n.inner_text()).strip()
-                        if not s or "€" in s:
-                            continue
-                        m = re.search(r"(\d+)\s*/\s*\d+", s.replace("\xa0",""))
-                        if m:
-                            tickets_sold = int(m.group(1))
-                            break
+                    full = (await row.inner_text()).replace("\xa0", " ")
+                    cleaned = " ".join(ln for ln in full.splitlines() if "€" not in ln)
+                    m = re.search(r"\b(\d+)\s*/\s*\d+\b", cleaned)
+                    if m:
+                        tickets_sold = int(m.group(1))
                 except Exception:
                     pass
 
-            # 3) fallback “donut”
+            # Fallback donut : chiffre au centre
             if tickets_sold is None:
                 try:
-                    donut = await card_el.query_selector("div[class*='CircleProgress'] span")
+                    donut = await row.query_selector("div[class*='CircleProgress'] span")
                     if donut:
                         t = (await donut.inner_text()).strip()
                         if t.isdigit():
