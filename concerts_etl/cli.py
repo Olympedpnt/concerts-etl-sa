@@ -1,82 +1,64 @@
 # concerts_etl/cli.py
-import asyncio
-import logging
-from typing import List, Dict, Any
+from __future__ import annotations
 
-from concerts_etl.core.models import NormalizedEvent
+import asyncio
+import json
+import logging
+from typing import Any, List, Dict
+
+from concerts_etl.adapters import shotgun, dice
+from concerts_etl.core.consolidate_events import consolidate_events
 from concerts_etl.core.gsheet import export_to_gsheet
-from concerts_etl.adapters.shotgun import run as run_shotgun
-from concerts_etl.adapters.dice import run as run_dice
 
 log = logging.getLogger(__name__)
 
 
-async def consolidate_events(shotgun_events: List[NormalizedEvent], dice_events: List[NormalizedEvent]) -> List[Dict[str, Any]]:
+def _json_default(o: Any):
     """
-    Fusionne les événements Shotgun et Dice sur (nom + datetime).
-    Retourne une liste de dicts prêts à être envoyés vers Google Sheets.
+    Fallback JSON encoder:
+    - datetime et autres objets → str(o)
     """
-    consolidated: Dict[tuple, Dict[str, Any]] = {}
-
-    # Normalisation clé (nom + date locale en iso)
-    def make_key(ev: NormalizedEvent):
-        return (
-            (ev.event_name or "").strip().lower(),
-            ev.event_datetime_local.isoformat() if ev.event_datetime_local else None,
-        )
-
-    # Shotgun d’abord
-    for ev in shotgun_events:
-        k = make_key(ev)
-        consolidated[k] = {
-            "event_name": ev.event_name,
-            "event_datetime_local": ev.event_datetime_local,
-            "shotgun_tickets_sold": ev.tickets_sold_total,
-            "dice_tickets_sold": None,
-        }
-
-    # Merge Dice
-    for ev in dice_events:
-        k = make_key(ev)
-        if k in consolidated:
-            consolidated[k]["dice_tickets_sold"] = ev.tickets_sold_total
-        else:
-            consolidated[k] = {
-                "event_name": ev.event_name,
-                "event_datetime_local": ev.event_datetime_local,
-                "shotgun_tickets_sold": None,
-                "dice_tickets_sold": ev.tickets_sold_total,
-            }
-
-    return list(consolidated.values())
+    try:
+        import datetime as _dt
+        if isinstance(o, (_dt.datetime, _dt.date, _dt.time)):
+            return o.isoformat()
+    except Exception:
+        pass
+    return str(o)
 
 
-async def run_all():
-    log.info("Démarrage de l’ETL concerts")
+async def run_all() -> None:
+    # 1) Collecte providers
+    log.info("Collecte Shotgun…")
+    sg_events = await shotgun.run()
 
-    # Lancer les 2 providers
-    log.info("→ Shotgun")
-    shotgun_events = await run_shotgun()
-    log.info(f"Shotgun: {len(shotgun_events)} événements")
+    log.info("Collecte DICE…")
+    dc_events = await dice.run()
 
-    log.info("→ Dice")
-    dice_events = await run_dice()
-    log.info(f"Dice: {len(dice_events)} événements")
+    # 2) Consolidation (fusion sur nom + datetime local)
+    consolidated: List[Dict[str, Any]] = consolidate_events(sg_events, dc_events)
 
-    # Consolidation
-    consolidated = await consolidate_events(shotgun_events, dice_events)
-    log.info(f"Consolidé: {len(consolidated)} lignes")
+    # 3) Écrit un petit aperçu JSON local (pour debug artefacts)
+    try:
+        with open("providers_preview.json", "w", encoding="utf-8") as f:
+            json.dump(consolidated[:20], f, ensure_ascii=False, indent=2, default=_json_default)
+    except Exception as e:
+        log.warning(f"Preview JSON writing failed: {e}")
 
-    # Export Google Sheet
-    await export_to_gsheet(consolidated)
+    # 4) Export Google Sheet
+    try:
+        await export_to_gsheet(consolidated)
+        log.info("Export Google Sheet terminé.")
+    except Exception as e:
+        log.error(f"Export Google Sheet échoué: {e}")
 
-    # En option : écrire un preview local
-    import json
-    with open("providers_preview.json", "w", encoding="utf-8") as f:
-        json.dump(consolidated[:20], f, ensure_ascii=False, indent=2)
+    # 5) Log final
+    log.info(
+        f"Collecte terminée — Shotgun={len(sg_events)} / Dice={len(dc_events)} / Consolidés={len(consolidated)}"
+    )
 
 
-def main():
+def main() -> None:
     asyncio.run(run_all())
 
 
