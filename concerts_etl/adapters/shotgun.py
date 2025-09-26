@@ -269,8 +269,8 @@ def normalize(cards: List[RawShotgunCard]) -> List[NormalizedEvent]:
 
         # enrich artist / venue
         artist, venue = _guess_artist_and_venue(c.event_name, venue_hint=c.city)
-        e.artist_name = artist
-        e.venue_name = venue or c.city
+        e.artist_name = e.artist_name or artist
+        e.venue_name = e.venue_name or venue or e.city
 
         out.append(e)
     return out
