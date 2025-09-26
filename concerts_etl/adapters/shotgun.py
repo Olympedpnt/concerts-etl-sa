@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import List, Tuple, Optional
 from tenacity import retry, wait_exponential, stop_after_attempt
 from playwright.async_api import async_playwright
+
 from concerts_etl.core.models import RawShotgunCard, NormalizedEvent
 from concerts_etl.core.config import settings
 
@@ -11,6 +12,7 @@ log = logging.getLogger(__name__)
 
 LOGIN_URL = "https://smartboard.shotgun.live/fr/login?destination=%2Fevents"
 EVENTS_URL = "https://smartboard.shotgun.live/events"
+
 
 # ------------------ Utils ------------------
 
@@ -34,6 +36,30 @@ def _stable_event_id(name: str, dt_text: Optional[str]) -> str:
     base = _slug(name or "event")
     key = f"{base}|{dt_text or ''}"
     return f"{base}-{hashlib.sha1(key.encode()).hexdigest()[:8]}"
+
+
+def _guess_artist_and_venue(event_name: str, venue_hint: str | None = None):
+    artist = None
+    venue = None
+
+    # Patterns simples: "ARTISTE @ LIEU" ou "ARTISTE - LIEU"
+    m = re.match(r"\s*(.+?)\s*(?:@|-|–|—)\s*(.+)\s*$", event_name or "", flags=re.IGNORECASE)
+    if m:
+        artist = m.group(1).strip()
+        venue = m.group(2).strip()
+
+    # Si on a un hint fiable pour le lieu, on le priorise
+    if venue_hint and venue_hint.strip():
+        venue = venue_hint.strip()
+
+    # nettoyage soft
+    if artist:
+        artist = re.sub(r"\s+", " ", artist)
+    if venue:
+        venue = re.sub(r"\s+", " ", venue)
+
+    return artist, venue
+
 
 # ------------------ Scraper ------------------
 
@@ -80,34 +106,13 @@ async def _collect_cards() -> List[RawShotgunCard]:
         pwd_input = page.locator('input[type="password"]').first
         await pwd_input.fill(settings.shotgun_password)
 
-        # bouton submit (le bouton peut rester disabled tant que le form n'a pas validé)
+        # bouton submit
         submit = page.locator('button[type="submit"]').first
-
-        # Déclenche les validations (blur/tab) sur les champs
-        try:
-            await email_input.press("Tab")
-            await pwd_input.press("Tab")
-        except Exception:
-            pass
-
-        # Attends que le bouton devienne enabled ; sinon "nudge" le champ password
         try:
             await submit.wait_for(state="enabled", timeout=8000)
-        except Exception:
-            # Petit "nudge" pour forcer la validation côté UI (AntD)
-            try:
-                await pwd_input.type(" ")
-                await pwd_input.press("Backspace")
-            except Exception:
-                pass
-
-        # Clique si possible, sinon Enter sur le champ mot de passe
-        try:
-            await submit.wait_for(state="enabled", timeout=5000)
             await submit.click()
         except Exception:
             await pwd_input.press("Enter")
-
 
         try:
             await page.wait_for_url(re.compile(r".*/events.*"), timeout=45000)
@@ -125,17 +130,10 @@ async def _collect_cards() -> List[RawShotgunCard]:
         except Exception:
             pass
 
-        # (2) Attends qu'au moins une statistique apparaisse (classe Ant Design)
-        try:
-            await page.wait_for_selector(".ant-statistic-content", timeout=15000)
-        except Exception:
-            # on continue, mais on dump si 0 carte
-            pass
-
-        # (3) Scroll pour charger (infini)
+        # (2) Scroll pour charger (infini)
         async def auto_scroll():
             prev = 0
-            for _ in range(8):   # 8 rafales suffisent pour une liste courte/moyenne
+            for _ in range(8):
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(700)
                 height = await page.evaluate("document.body.scrollHeight")
@@ -145,9 +143,9 @@ async def _collect_cards() -> List[RawShotgunCard]:
 
         await auto_scroll()
 
-        # (4) Sélecteurs de cartes — on tente plusieurs patterns
+        # (3) Sélecteurs de cartes
         selectors = [
-            "div.relative.flex.h-full.w-full.flex-col",   # vu dans ton extrait
+            "div.relative.flex.h-full.w-full.flex-col",
             "[class*='relative'][class*='flex'][class*='flex-col']",
             "[data-testid='event-card']"
         ]
@@ -157,7 +155,6 @@ async def _collect_cards() -> List[RawShotgunCard]:
             if cards:
                 break
 
-        # DEBUG si rien trouvé
         if not cards:
             try:
                 await page.screenshot(path="events_empty.png", full_page=True)
@@ -166,26 +163,24 @@ async def _collect_cards() -> List[RawShotgunCard]:
                     f.write(html)
             except Exception:
                 pass
-            return []  # pas de carte → l'ETL retournera no_data (et on aura artefacts)
+            return []
 
         results: List[RawShotgunCard] = []
         for c in cards:
-            # nom
             name_el = await c.query_selector("span.truncate.text-sm.font-medium")
             if not name_el:
-                # fallback: premier <span> gras dans le bloc
                 name_el = await c.query_selector("span.font-medium, h3, a[title]")
             name = (await name_el.inner_text()).strip() if name_el else None
             if not name:
                 continue
 
-            # date locale
+            # date
             date_el = await c.query_selector("span.text-white-700.text-xs.font-normal")
             if not date_el:
                 date_el = await c.query_selector("time, [class*='text-xs']")
             dt_text = (await date_el.inner_text()).strip() if date_el else None
 
-            # stats € et #
+            # stats
             values = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-value")
             suffixes = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-suffix")
 
@@ -204,15 +199,8 @@ async def _collect_cards() -> List[RawShotgunCard]:
                 else:
                     ints.append((_parse_int(txt), await has_today(i)))
 
-            gross_total = gross_today = None
-            for val, today in euros:
-                if today: gross_today = val
-                elif gross_total is None: gross_total = val
-
-            tickets_total = tickets_today = None
-            for val, today in ints:
-                if today: tickets_today = val
-                elif tickets_total is None: tickets_total = val
+            gross_total = next((val for val, today in euros if not today), None)
+            tickets_total = next((val for val, today in ints if not today), None)
 
             pct_el = await c.query_selector("span.text-xs.font-semibold, [class*='font-semibold']")
             sell_through_pct = float(_parse_int(await pct_el.inner_text()) or 0) if pct_el else None
@@ -225,17 +213,11 @@ async def _collect_cards() -> List[RawShotgunCard]:
             event_dt = None
             if dt_text:
                 try:
-                    cleaned = (dt_text
-                               .replace("lun.", "lun").replace("mar.", "mar").replace("mer.", "mer")
-                               .replace("jeu.", "jeu").replace("ven.", "ven").replace("sam.", "sam").replace("dim.", "dim")
-                               .replace("janv.", "janv").replace("févr.", "fév").replace("avr.", "avr")
-                               .replace("juil.", "juil").replace("sept.", "sept").replace("oct.", "oct")
-                               .replace("nov.", "nov").replace("déc.", "déc"))
-                    # best-effort; si fail -> None
                     from datetime import datetime as _dt
                     for fmt in ("%a %d %b %Y %H:%M", "%a %d %b. %Y %H:%M"):
                         try:
-                            event_dt = _dt.strptime(cleaned, fmt); break
+                            event_dt = _dt.strptime(dt_text, fmt)
+                            break
                         except Exception:
                             pass
                 except Exception:
@@ -248,7 +230,6 @@ async def _collect_cards() -> List[RawShotgunCard]:
                 city=None,
                 country=None,
                 gross_total=gross_total,
-                gross_today=gross_today,
                 tickets_sold_total=tickets_total,
                 sell_through_pct=sell_through_pct,
                 currency="EUR",
@@ -258,15 +239,17 @@ async def _collect_cards() -> List[RawShotgunCard]:
                 ingestion_run_id=run_id,
             ))
 
-        await context.close(); await browser.close()
+        await context.close()
+        await browser.close()
         return results
 
 
 # ------------------ Normalisation ------------------
 
 def normalize(cards: List[RawShotgunCard]) -> List[NormalizedEvent]:
-    return [
-        NormalizedEvent(
+    out: List[NormalizedEvent] = []
+    for c in cards:
+        e = NormalizedEvent(
             provider="shotgun",
             event_id_provider=c.event_id_provider,
             event_name=c.event_name,
@@ -283,8 +266,15 @@ def normalize(cards: List[RawShotgunCard]) -> List[NormalizedEvent]:
             scrape_ts_utc=c.scrape_ts_utc,
             ingestion_run_id=c.ingestion_run_id,
         )
-        for c in cards
-    ]
+
+        # enrich artist / venue
+        artist, venue = _guess_artist_and_venue(c.event_name, venue_hint=c.city)
+        e.artist_name = artist
+        e.venue_name = venue or c.city
+
+        out.append(e)
+    return out
+
 
 async def run() -> List[NormalizedEvent]:
     cards = await _collect_cards()

@@ -1,110 +1,43 @@
 # concerts_etl/adapters/dice.py
 from __future__ import annotations
 
-import uuid
+import asyncio
 import logging
-from datetime import datetime, timezone as tzmod
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-from concerts_etl.core.models import NormalizedEvent
 from concerts_etl.core.config import settings
+from concerts_etl.core.models import NormalizedEvent
 
 log = logging.getLogger(__name__)
 
-API_URL = "https://partners-endpoint.dice.fm/graphql"
+GRAPHQL_URL = "https://partners-endpoint.dice.fm/graphql"
 
+# ----------------------------- GraphQL ---------------------------------
 
-# ---------------- utils ----------------
-
-def _parse_iso_dt_local(iso_str: str) -> Optional[datetime]:
-    """
-    Convertit un ISO8601 (ex: "2025-09-25T20:00:00Z") en datetime naïf,
-    destiné à `event_datetime_local`. Le fuseau est renseigné à part.
-    """
-    if not iso_str:
-        return None
-    try:
-        if iso_str.endswith("Z"):
-            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        else:
-            dt = datetime.fromisoformat(iso_str)
-        return dt.replace(tzinfo=None)  # naïf
-    except Exception:
-        return None
-
-
-async def build(ev: dict) -> NormalizedEvent:
-    eid = ev.get("id") or ev.get("eventIdLive") or ""
-    name = ev.get("name") or ""
-
-    # date/heure
-    start_iso = ev.get("startDatetime")
-    dt_local = _parse_iso_dt_local(start_iso)
-
-    # fuseau horaire
-    tz_name = None
-    try:
-        venues = ev.get("venues") or []
-        if venues and isinstance(venues, list):
-            tz_name = (venues[0] or {}).get("timezoneName")
-    except Exception:
-        pass
-    timezone_str = tz_name or "Europe/Paris"
-
-    # tickets vendus
-    tickets_conn = ev.get("tickets") or {}
-    tickets_sold = tickets_conn.get("totalCount")
-
-    # allocation totale
-    total_alloc = ev.get("totalTicketAllocationQty")
-
-    # devise
-    currency = ev.get("currency") or "EUR"
-
-    return NormalizedEvent(
-        provider="dice",
-        event_id_provider=str(eid),
-        event_name=name,
-        city=None,
-        country=None,
-        event_datetime_local=dt_local,
-        timezone=timezone_str,
-        status="on sale",
-        tickets_sold_total=tickets_sold,
-        gross_total=None,
-        net_total=None,
-        currency=currency,
-        sell_through_pct=None,  # à calculer si besoin via tickets_sold / total_alloc
-        scrape_ts_utc=datetime.now(tzmod.utc),
-        ingestion_run_id=str(uuid.uuid4()),
-    )
-
-
-# ---------------- requête API ----------------
-
-QUERY_EVENTS = """
-query events($first: Int!, $after: String) {
+_EVENTS_QUERY = """
+query Events($first: Int!, $after: String, $from: String) {
   viewer {
-    events(first: $first, after: $after) {
+    events(first: $first, after: $after, where: { startDatetime: { gte: $from } }) {
       totalCount
-      pageInfo {
-        endCursor
-        hasNextPage
-      }
+      pageInfo { endCursor hasNextPage }
       edges {
         node {
           id
           name
           startDatetime
-          totalTicketAllocationQty
           currency
-          venues { timezoneName }
-          tickets(first: 1) {
-            totalCount
+          artists { name }
+          venues {
+            name
+            city
+            country
+            timezoneName
           }
+          tickets(first: 1) { totalCount }  # total vendus (connexion paginée)
         }
       }
     }
@@ -112,52 +45,139 @@ query events($first: Int!, $after: String) {
 }
 """
 
+# ----------------------------- Utils -----------------------------------
 
-async def fetch_events() -> list[dict]:
+def _parse_iso(dt: Optional[str]) -> Optional[datetime]:
+    if not dt:
+        return None
+    try:
+        # renvoie aware si 'Z' ou offset, sinon naive
+        return datetime.fromisoformat(dt.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _pick_first(lst: Optional[List[Dict[str, Any]]], key: str) -> Optional[str]:
+    if not lst:
+        return None
+    v = (lst[0] or {}).get(key)
+    return v.strip() if isinstance(v, str) else v
+
+
+# --------------------------- Fetch layer --------------------------------
+
+async def _gql(client: httpx.AsyncClient, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    r = await client.post(
+        GRAPHQL_URL,
+        json={"query": query, "variables": variables},
+        timeout=30.0,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if "errors" in payload and payload["errors"]:
+        raise RuntimeError(f"DICE GraphQL errors: {payload['errors']}")
+    return payload["data"]
+
+
+async def fetch_events() -> List[Dict[str, Any]]:
     """
-    Récupère tous les événements via l'API partenaire DICE.
+    Récupère tous les événements à partir d'une date basse (hier) avec pagination.
     """
-    token = settings.dice_api_token
+    token = settings.dice_api_token  # doit exister dans Settings
     if not token:
-        raise RuntimeError("DICE_API_TOKEN manquant (config/secrets)")
+        raise RuntimeError("DICE_API_TOKEN manquant (settings.dice_api_token).")
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
-    events: list[dict] = []
-    after = None
-    client = httpx.AsyncClient(timeout=30)
+    # date pivot : un peu dans le passé pour couvrir les shows imminents
+    from_lower = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    try:
+    out: List[Dict[str, Any]] = []
+    after: Optional[str] = None
+    page = 0
+
+    async with httpx.AsyncClient(headers=headers, http2=True) as client:
         while True:
-            variables = {"first": 50, "after": after}
-            r = await client.post(
-                API_URL, headers=headers, json={"query": QUERY_EVENTS, "variables": variables}
+            page += 1
+            data = await _gql(
+                client,
+                _EVENTS_QUERY,
+                {"first": 100, "after": after, "from": from_lower},
             )
-            r.raise_for_status()
-            data = r.json()
-            viewer = (data.get("data") or {}).get("viewer") or {}
-            evs = ((viewer.get("events") or {}).get("edges")) or []
-            for e in evs:
-                if e and e.get("node"):
-                    events.append(e["node"])
-            page_info = (viewer.get("events") or {}).get("pageInfo") or {}
-            if not page_info.get("hasNextPage"):
+            evs = data["viewer"]["events"]
+            edges = evs.get("edges", [])
+            out.extend([e["node"] for e in edges])
+
+            has_next = evs.get("pageInfo", {}).get("hasNextPage", False)
+            after = evs.get("pageInfo", {}).get("endCursor")
+            log.info("Dice API: page %s, cumul %s événements", page, len(out))
+            if not has_next:
                 break
-            after = page_info.get("endCursor")
-    finally:
-        await client.aclose()
 
-    log.info(f"Dice API: {len(events)} événements récupérés")
-    return events
+    log.info("Dice API: %s événements récupérés", len(out))
+    return out
 
 
-# ---------------- main entrypoint ----------------
+# --------------------------- Build layer --------------------------------
+
+def _build_normalized(ev: Dict[str, Any]) -> NormalizedEvent:
+    name = (ev.get("name") or "").strip()
+    dt_local = _parse_iso(ev.get("startDatetime"))
+    venues = ev.get("venues") or []
+    artists = ev.get("artists") or []
+    tickets = ev.get("tickets") or {}
+
+    venue_name = _pick_first(venues, "name")
+    city = _pick_first(venues, "city")
+    country = _pick_first(venues, "country")
+    tz = _pick_first(venues, "timezoneName") or "Europe/Paris"
+
+    artist_name = _pick_first(artists, "name")
+
+    tickets_sold = None
+    try:
+        # la connexion expose totalCount
+        tickets_sold = tickets.get("totalCount")
+        if isinstance(tickets_sold, str) and tickets_sold.isdigit():
+            tickets_sold = int(tickets_sold)
+    except Exception:
+        tickets_sold = None
+
+    currency = ev.get("currency")
+    if isinstance(currency, str):
+        currency = currency.strip()
+
+    return NormalizedEvent(
+        provider="dice",
+        event_id_provider=ev.get("id") or "",
+        event_name=name,
+        city=city,
+        country=country,
+        event_datetime_local=dt_local,
+        timezone=tz,
+        status="on sale",                # pas exposé : défaut raisonnable
+        tickets_sold_total=tickets_sold, # total des tickets (vendus)
+        gross_total=None,
+        net_total=None,
+        currency=currency,
+        sell_through_pct=None,
+        scrape_ts_utc=datetime.now(timezone.utc),
+        ingestion_run_id="dice-api",
+        # champs d’enrichissement pour le matching
+        artist_name=artist_name,
+        venue_name=venue_name or city,
+    )
+
+
+# ------------------------------ Main ------------------------------------
 
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 async def run() -> List[NormalizedEvent]:
     events = await fetch_events()
-    built = [await build(e) for e in events]
+    # construction parallèle I/O bound (léger ici, mais propre)
+    loop = asyncio.get_event_loop()
+    built = await asyncio.gather(*[loop.run_in_executor(None, _build_normalized, e) for e in events])
     return built
