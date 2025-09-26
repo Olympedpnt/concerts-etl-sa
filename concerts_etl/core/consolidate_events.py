@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from concerts_etl.core.models import NormalizedEvent
@@ -17,28 +18,36 @@ def _norm_name(name: Optional[str]) -> str:
         return ""
     s = _strip_accents(name).lower()
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^\w\s]", "", s)  # retire ponctuation
+    s = re.sub(r"[^\w\s]", "", s)
     return s.strip()
 
 
 def _key(ev: NormalizedEvent) -> Tuple[str, Optional[str]]:
-    """
-    Clé de fusion: (nom normalisé, datetime ISO sans tz si présent).
-    On reste strict pour éviter les collisions hasardeuses.
-    """
+    # Clé stricte: (nom normalisé, datetime ISO si présent)
     nm = _norm_name(ev.event_name)
-    dt = ev.event_datetime_local.isoformat() if ev.event_datetime_local else None
-    return nm, dt
+    dt_iso = ev.event_datetime_local.isoformat() if ev.event_datetime_local else None
+    return nm, dt_iso
+
+
+def _sort_key(row: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Retourne une clé de tri sûre (toujours des strings) :
+    - date en ISO string si datetime, sinon str(value), sinon ""
+    - nom en minuscule
+    """
+    v = row.get("event_datetime_local")
+    if isinstance(v, datetime):
+        dt_key = v.isoformat()
+    else:
+        dt_key = str(v) if v is not None else ""
+    name_key = (row.get("event_name") or "").lower()
+    return dt_key, name_key
 
 
 def consolidate_events(
     shotgun_events: List[NormalizedEvent],
     dice_events: List[NormalizedEvent],
 ) -> List[Dict[str, Any]]:
-    """
-    Fusionne les événements Shotgun & DICE sur (nom normalisé + datetime local exact).
-    Retourne une liste de dicts prêts pour export GSheet.
-    """
     sg_map: Dict[Tuple[str, Optional[str]], NormalizedEvent] = {}
     dc_map: Dict[Tuple[str, Optional[str]], NormalizedEvent] = {}
 
@@ -54,18 +63,15 @@ def consolidate_events(
         sg = sg_map.get(k)
         dc = dc_map.get(k)
 
-        # On choisit un nom affiché prioritairement depuis Shotgun, sinon DICE
         event_name = (sg.event_name if sg else (dc.event_name if dc else "")).strip()
         event_dt = sg.event_datetime_local if sg else (dc.event_datetime_local if dc else None)
 
         row: Dict[str, Any] = {
             "event_name": event_name,
-            "event_datetime_local": event_dt,
+            "event_datetime_local": event_dt,  # peut rester datetime; l’export le convertira
             "shotgun_tickets_sold": sg.tickets_sold_total if sg else None,
             "dice_tickets_sold": dc.tickets_sold_total if dc else None,
         }
-
-        # Infos utiles pour debug / traçabilité
         if sg:
             row["shotgun_event_id"] = sg.event_id_provider
         if dc:
@@ -73,6 +79,5 @@ def consolidate_events(
 
         rows.append(row)
 
-    # tri par date puis nom
-    rows.sort(key=lambda r: ((r["event_datetime_local"] or ""), r["event_name"] or ""))
+    rows.sort(key=_sort_key)
     return rows
