@@ -99,7 +99,7 @@ async def fetch_events() -> List[Dict[str, Any]]:
     after: Optional[str] = None
     page = 0
 
-    async with httpx.AsyncClient(headers=headers, http2=True) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=15) as client:
         while True:
             page += 1
             data = await _gql(
