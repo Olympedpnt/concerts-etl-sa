@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -19,9 +19,9 @@ GRAPHQL_URL = "https://partners-endpoint.dice.fm/graphql"
 # ----------------------------- GraphQL ---------------------------------
 
 _EVENTS_QUERY = """
-query Events($first: Int!, $after: String, $from: String) {
+query Events($after: String, $from: Datetime) {
   viewer {
-    events(first: $first, after: $after, where: { startDatetime: { gte: $from } }) {
+    events(first: 100, after: $after, where: { startDatetime: { gte: $from } }) {
       totalCount
       pageInfo { endCursor hasNextPage }
       edges {
@@ -47,11 +47,16 @@ query Events($first: Int!, $after: String, $from: String) {
 
 # ----------------------------- Utils -----------------------------------
 
+def _isoz(dt: datetime) -> str:
+    """Format UTC en 'YYYY-MM-DDTHH:MM:SSZ'."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _parse_iso(dt: Optional[str]) -> Optional[datetime]:
     if not dt:
         return None
     try:
-        # renvoie aware si 'Z' ou offset, sinon naive
+        # 'Z' → '+00:00' pour fromisoformat
         return datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except Exception:
         return None
@@ -70,7 +75,7 @@ async def _gql(client: httpx.AsyncClient, query: str, variables: Dict[str, Any])
     r = await client.post(
         GRAPHQL_URL,
         json={"query": query, "variables": variables},
-        timeout=30.0,
+        timeout=45.0,  # un peu large pour la pagination
     )
     r.raise_for_status()
     payload = r.json()
@@ -81,9 +86,9 @@ async def _gql(client: httpx.AsyncClient, query: str, variables: Dict[str, Any])
 
 async def fetch_events() -> List[Dict[str, Any]]:
     """
-    Récupère tous les événements à partir d'une date basse (hier) avec pagination.
+    Récupère tous les événements à partir d'une date basse (aujourd'hui 00:00 UTC) avec pagination.
     """
-    token = settings.dice_api_token  # doit exister dans Settings
+    token = settings.dice_api_token  # Settings doit exposer dice_api_token
     if not token:
         raise RuntimeError("DICE_API_TOKEN manquant (settings.dice_api_token).")
 
@@ -92,27 +97,30 @@ async def fetch_events() -> List[Dict[str, Any]]:
         "Content-Type": "application/json",
     }
 
-    # date pivot : un peu dans le passé pour couvrir les shows imminents
-    from_lower = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    # point de départ : aujourd'hui 00:00 UTC → ISO-Z
+    from_dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    from_lower = _isoz(from_dt)
 
     out: List[Dict[str, Any]] = []
     after: Optional[str] = None
     page = 0
 
-    async with httpx.AsyncClient(headers=headers, timeout=15) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
         while True:
             page += 1
             data = await _gql(
                 client,
                 _EVENTS_QUERY,
-                {"first": 100, "after": after, "from": from_lower},
+                {"after": after, "from": from_lower},
             )
             evs = data["viewer"]["events"]
-            edges = evs.get("edges", [])
-            out.extend([e["node"] for e in edges])
+            edges = evs.get("edges", []) or []
+            out.extend([e["node"] for e in edges if e and "node" in e])
 
-            has_next = evs.get("pageInfo", {}).get("hasNextPage", False)
-            after = evs.get("pageInfo", {}).get("endCursor")
+            page_info = evs.get("pageInfo", {}) or {}
+            has_next = bool(page_info.get("hasNextPage"))
+            after = page_info.get("endCursor")
+
             log.info("Dice API: page %s, cumul %s événements", page, len(out))
             if not has_next:
                 break
@@ -126,6 +134,7 @@ async def fetch_events() -> List[Dict[str, Any]]:
 def _build_normalized(ev: Dict[str, Any]) -> NormalizedEvent:
     name = (ev.get("name") or "").strip()
     dt_local = _parse_iso(ev.get("startDatetime"))
+
     venues = ev.get("venues") or []
     artists = ev.get("artists") or []
     tickets = ev.get("tickets") or {}
@@ -137,13 +146,11 @@ def _build_normalized(ev: Dict[str, Any]) -> NormalizedEvent:
 
     artist_name = _pick_first(artists, "name")
 
-    tickets_sold = None
-    try:
-        # la connexion expose totalCount
-        tickets_sold = tickets.get("totalCount")
-        if isinstance(tickets_sold, str) and tickets_sold.isdigit():
-            tickets_sold = int(tickets_sold)
-    except Exception:
+    # Garde-fous sur totalCount
+    tickets_sold = tickets.get("totalCount") if isinstance(tickets, dict) else None
+    if isinstance(tickets_sold, str) and tickets_sold.isdigit():
+        tickets_sold = int(tickets_sold)
+    elif not isinstance(tickets_sold, int):
         tickets_sold = None
 
     currency = ev.get("currency")
@@ -158,7 +165,7 @@ def _build_normalized(ev: Dict[str, Any]) -> NormalizedEvent:
         country=country,
         event_datetime_local=dt_local,
         timezone=tz,
-        status="on sale",                # pas exposé : défaut raisonnable
+        status="on sale",                # défaut
         tickets_sold_total=tickets_sold, # total des tickets (vendus)
         gross_total=None,
         net_total=None,
@@ -177,7 +184,7 @@ def _build_normalized(ev: Dict[str, Any]) -> NormalizedEvent:
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 async def run() -> List[NormalizedEvent]:
     events = await fetch_events()
-    # construction parallèle I/O bound (léger ici, mais propre)
+    # construction parallèle CPU-bound léger (mapping → NormalizedEvent)
     loop = asyncio.get_event_loop()
     built = await asyncio.gather(*[loop.run_in_executor(None, _build_normalized, e) for e in events])
     return built
