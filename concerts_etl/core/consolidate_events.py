@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from concerts_etl.core.models import NormalizedEvent
 
 
-# ---------------- Utils ----------------
-
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
@@ -26,7 +24,8 @@ def _normalize(s: Optional[str]) -> str:
 
 def _event_key(e: NormalizedEvent) -> Tuple[str, str]:
     """
-    Clé de jointure = (artist normalisé, date locale ISO)
+    Clé de matching basée uniquement sur artiste + date (jour),
+    en ignorant l'heure et en normalisant les accents.
     """
     artist = _normalize(e.artist_name or e.event_name or "")
     date_key = ""
@@ -43,8 +42,6 @@ def _sort_key(row: Dict[str, Any]) -> Tuple[str, str]:
         dt_key = str(v) if v else ""
     return dt_key, (row.get("event_name") or "").lower()
 
-
-# ---------------- Main ----------------
 
 def consolidate_events(
     shotgun_events: List[NormalizedEvent],
@@ -76,7 +73,6 @@ def consolidate_events(
             "artist": sg.artist_name if sg else (dc.artist_name if dc else ""),
             "venue": sg.venue_name if sg else (dc.venue_name if dc else ""),
         }
-
         if sg:
             row["shotgun_event_id"] = sg.event_id_provider
         if dc:
