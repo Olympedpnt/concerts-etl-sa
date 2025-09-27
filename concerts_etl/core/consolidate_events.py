@@ -13,38 +13,34 @@ def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
-def _norm_artist(s: Optional[str]) -> str:
+def _normalize(s: Optional[str]) -> str:
     if not s:
         return ""
-    s = s.strip()
     s = _strip_accents(s).lower()
     s = re.sub(r"\s+", " ", s)
-    return s
+    s = re.sub(r"[^\w\s]", "", s)
+    return s.strip()
 
 
-def _artist_key(e: NormalizedEvent) -> str:
-    artist = e.artist_name or ""
-    if not artist and e.event_name:
-        m = re.match(r"\s*(.+?)\s*(?:@|-|–|—)\s*.+$", e.event_name)
-        artist = (m.group(1).strip() if m else e.event_name.strip())
-    return _norm_artist(artist)
+def _event_key(e: NormalizedEvent) -> Tuple[str, str]:
+    """
+    Clé de matching basée uniquement sur artiste + date (jour),
+    en ignorant l'heure et en normalisant les accents.
+    """
+    artist = _normalize(e.artist_name or e.event_name or "")
+    date_key = ""
+    if e.event_datetime_local:
+        date_key = e.event_datetime_local.date().isoformat()
+    return artist, date_key
 
 
-def _date_key(e: NormalizedEvent) -> str:
-    if isinstance(e.event_datetime_local, datetime):
-        try:
-            return e.event_datetime_local.date().isoformat()
-        except Exception:
-            return ""
-    return ""
-
-
-def _row_sort_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
+def _sort_key(row: Dict[str, Any]) -> Tuple[str, str]:
     v = row.get("event_datetime_local")
-    dt_key = v.date().isoformat() if isinstance(v, datetime) else (str(v) if v else "")
-    artist = (row.get("artist") or "").lower()
-    name = (row.get("event_name") or "").lower()
-    return dt_key, artist, name
+    if isinstance(v, datetime):
+        dt_key = v.isoformat()
+    else:
+        dt_key = str(v) if v else ""
+    return dt_key, (row.get("event_name") or "").lower()
 
 
 def consolidate_events(
@@ -55,14 +51,9 @@ def consolidate_events(
     dc_map: Dict[Tuple[str, str], NormalizedEvent] = {}
 
     for ev in shotgun_events or []:
-        k = (_artist_key(ev), _date_key(ev))
-        if any(k):
-            sg_map[k] = ev
-
+        sg_map[_event_key(ev)] = ev
     for ev in dice_events or []:
-        k = (_artist_key(ev), _date_key(ev))
-        if any(k):
-            dc_map[k] = ev
+        dc_map[_event_key(ev)] = ev
 
     all_keys = set(sg_map.keys()) | set(dc_map.keys())
     rows: List[Dict[str, Any]] = []
@@ -71,31 +62,17 @@ def consolidate_events(
         sg = sg_map.get(k)
         dc = dc_map.get(k)
 
-        # Accès sûrs
-        sg_name = sg.event_name if sg else ""
-        dc_name = dc.event_name if dc else ""
-        event_name = (sg_name or dc_name or "").strip()
-
-        event_dt = (sg.event_datetime_local if (sg and sg.event_datetime_local)
-                    else (dc.event_datetime_local if dc else None))
-
-        sg_artist = sg.artist_name if sg else None
-        dc_artist = dc.artist_name if dc else None
-        artist = (sg_artist or dc_artist or "").strip()
-
-        sg_venue = sg.venue_name if sg else None
-        dc_venue = dc.venue_name if dc else None
-        venue = (sg_venue or dc_venue or "").strip()
+        event_name = (sg.event_name if sg else (dc.event_name if dc else "")).strip()
+        event_dt = sg.event_datetime_local if sg else (dc.event_datetime_local if dc else None)
 
         row: Dict[str, Any] = {
             "event_name": event_name,
             "event_datetime_local": event_dt,
-            "artist": artist,
-            "venue": venue,
-            "shotgun_tickets_sold": (sg.tickets_sold_total if sg else None),
-            "dice_tickets_sold": (dc.tickets_sold_total if dc else None),
+            "shotgun_tickets_sold": sg.tickets_sold_total if sg else None,
+            "dice_tickets_sold": dc.tickets_sold_total if dc else None,
+            "artist": sg.artist_name if sg else (dc.artist_name if dc else ""),
+            "venue": sg.venue_name if sg else (dc.venue_name if dc else ""),
         }
-
         if sg:
             row["shotgun_event_id"] = sg.event_id_provider
         if dc:
@@ -103,5 +80,5 @@ def consolidate_events(
 
         rows.append(row)
 
-    rows.sort(key=_row_sort_key)
+    rows.sort(key=_sort_key)
     return rows
