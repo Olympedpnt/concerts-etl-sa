@@ -1,13 +1,6 @@
-from __future__ import annotations
-from typing import Callable, Awaitable, Dict, List
-from concerts_etl.core.models import NormalizedEvent
+# concerts_etl/adapters/__init__.py
 
-# Import des runners de chaque provider
-from .dice import run as run_dice
 from .shotgun import run as run_shotgun
+from .dice import run as run_dice
 
-# Registre des providers disponibles
-REGISTRY: Dict[str, Callable[[], Awaitable[List[NormalizedEvent]]]] = {
-    "shotgun": run_shotgun,
-    "dice": run_dice,
-}
+__all__ = ["run_shotgun", "run_dice"]
