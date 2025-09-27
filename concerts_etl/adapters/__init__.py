@@ -1,6 +1,9 @@
 # concerts_etl/adapters/__init__.py
 
-from .shotgun import run as run_shotgun
-from .dice import run as run_dice
+from .shotgun import run as run_shotgun   # async def run() -> List[NormalizedEvent]
+from .dice import run as run_dice         # async def run() -> List[NormalizedEvent]
 
-__all__ = ["run_shotgun", "run_dice"]
+REGISTRY = {
+    "shotgun": run_shotgun,
+    "dice": run_dice,
+}
