@@ -234,7 +234,7 @@ async def run() -> List[NormalizedEvent]:
                 values = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-value")
                 suffixes = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-suffix")
 
-                def has_today(i: int) -> bool:
+                async def has_today(i: int) -> bool:
                     if i < len(suffixes):
                         suf = (await suffixes[i].inner_text()).lower()
                         return "aujourd" in suf
