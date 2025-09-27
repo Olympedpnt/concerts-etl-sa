@@ -228,8 +228,11 @@ async def run() -> List[NormalizedEvent]:
                 dt_text = (await date_el.inner_text()).strip() if date_el else None
                 event_dt = _parse_fr_datetime(dt_text)
 
-            # --- Stats ---
-            gross_total, tickets_total, sell_through_pct = None, None, None
+            # --- Statistiques (€, #, %) ---
+            gross_total = None
+            tickets_total = None
+            sell_through_pct = None
+
             try:
                 values = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-value")
                 suffixes = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-suffix")
@@ -249,6 +252,7 @@ async def run() -> List[NormalizedEvent]:
                     else:
                         ints.append((_parse_int(txt), await has_today(i)))
 
+                # on prend les premiers “totaux” (pas aujourd’hui)
                 for val, today in euros:
                     if not today:
                         gross_total = val
@@ -260,11 +264,17 @@ async def run() -> List[NormalizedEvent]:
 
                 pct_el = await c.query_selector("span.text-xs.font-semibold, [class*='font-semibold']")
                 if pct_el:
-                    sell_through_pct = float(_parse_int(await pct_el.inner_text()) or 0)
+                    pct_txt = await pct_el.inner_text()
+                    stp = _parse_int(pct_txt)
+                    sell_through_pct = float(stp) if stp is not None else None
             except Exception:
                 pass
 
-            status = "sold out" if "COMPLET" in (await c.inner_text()).upper() else "on sale"
+            # --- Statut (simple heuristique) ---
+            full_text = (await c.inner_text()).upper()
+            status = "sold out" if "COMPLET" in full_text else "on sale"
+
+            # --- ID stable ---
             dt_key = event_dt.isoformat() if event_dt else None
             event_id_provider = _stable_event_id(event_name, dt_key)
 
@@ -274,7 +284,7 @@ async def run() -> List[NormalizedEvent]:
                 event_name=event_name,
                 city=city,
                 country=None,
-                event_datetime_local=event_dt,
+                event_datetime_local=event_dt,       # NAIF local
                 timezone="Europe/Paris",
                 status=status,
                 tickets_sold_total=tickets_total,
@@ -284,12 +294,13 @@ async def run() -> List[NormalizedEvent]:
                 sell_through_pct=sell_through_pct,
                 scrape_ts_utc=now,
                 ingestion_run_id=run_id,
+                # clés de matching
                 artist_name=artist_name,
                 venue_name=venue_name or city,
             ))
 
-        await context.close(); await browser.close()
-
-        out = [_fallback_artist_and_venue(e) for e in out]
-        log.info("Shotgun: %d events", len(out))
+        # FIN: fermer proprement et RETOURNER out
+        await context.close()
+        await browser.close()
+        log.info("Shotgun: %d événements parsés", len(out))
         return out

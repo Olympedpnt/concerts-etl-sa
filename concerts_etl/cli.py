@@ -33,6 +33,7 @@ async def run_all():
     log.info("Shotgun: %d events", len(sg_events))
     log.info("Dice: %d events", len(dc_events))
 
+
     # --- Consolidation ---
     rows: List[Dict[str, Any]] = consolidate_events(sg_events, dc_events)
 
