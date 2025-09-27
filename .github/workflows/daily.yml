@@ -23,7 +23,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
           playwright install --with-deps chromium
-          pip install gspread google-auth google-auth-oauthlib python-dotenv
+          pip install gspread google-auth google-auth-oauthlib python-dotenv dateparser
+
 
       # --- Config secrets (Service Account JSON) ---
       - name: Configure env
