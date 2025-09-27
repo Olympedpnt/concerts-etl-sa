@@ -63,7 +63,9 @@ def consolidate_events(
         dc = dc_map.get(k)
 
         event_name = (sg.event_name if sg else (dc.event_name if dc else "")).strip()
-        event_dt = sg.event_datetime_local if sg else (dc.event_datetime_local if dc else None)
+        event_dt = sg.event_datetime_local or (dc.event_datetime_local if dc else None)
+        if event_dt:
+            event_dt = event_dt.date()   # <-- on écrase en date seule
 
         row: Dict[str, Any] = {
             "event_name": event_name,
