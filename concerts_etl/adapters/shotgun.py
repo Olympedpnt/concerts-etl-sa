@@ -11,7 +11,6 @@ from typing import List, Optional, Tuple
 
 from tenacity import retry, wait_exponential, stop_after_attempt
 from playwright.async_api import async_playwright
-
 import dateparser
 
 from concerts_etl.core.models import NormalizedEvent
@@ -23,20 +22,18 @@ LOGIN_URL = "https://smartboard.shotgun.live/fr/login?destination=%2Fevents"
 EVENTS_URL = "https://smartboard.shotgun.live/events"
 
 
-# ------------------ Utils ------------------
+# ------------------ Helpers ------------------
 
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
-
-def _parse_money(text: str) -> Tuple[Optional[float], Optional[str]]:
+def _parse_money(text: str) -> Optional[float]:
     if not text:
-        return None, None
+        return None
     t = text.replace("€", "").replace("\u00a0", "").replace("\u202f", "").replace(" ", "")
     t = t.replace(".", "").replace(",", ".")
     m = re.findall(r"-?\d+(?:\.\d+)?", t)
-    return (float(m[0]), "EUR") if m else (None, "EUR")
-
+    return float(m[0]) if m else None
 
 def _parse_int(text: str) -> Optional[int]:
     if not text:
@@ -44,52 +41,68 @@ def _parse_int(text: str) -> Optional[int]:
     m = re.findall(r"\d+", text.replace("\u00a0", " ").replace("\u202f", " "))
     return int(m[0]) if m else None
 
-
 def _slug(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
     return re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
-
 
 def _stable_event_id(name: str, dt_key: Optional[str]) -> str:
     base = _slug(name or "event")
     key = f"{base}|{dt_key or ''}"
     return f"{base}-{hashlib.sha1(key.encode()).hexdigest()[:8]}"
 
-
 def _parse_fr_datetime(dt_text: Optional[str]) -> Optional[datetime]:
+    """
+    Parse une date FR type "ven. 10 oct. 2025 19:30" ou variantes.
+    Retourne un datetime **naïf** (Europe/Paris) pour rester cohérent
+    avec timezone="Europe/Paris".
+    """
     if not dt_text:
         return None
-    return dateparser.parse(
+    dt = dateparser.parse(
         dt_text.strip(),
         languages=["fr"],
         settings={
             "TIMEZONE": "Europe/Paris",
-            "RETURN_AS_TIMEZONE_AWARE": False,
+            "RETURN_AS_TIMEZONE_AWARE": False,  # NAÏF
             "PREFER_DATES_FROM": "future",
         },
     )
+    return dt
 
+_ARTIST_SEP = re.compile(r"\s*(?:@|-|–|—)\s*")
 
-def _guess_artist_and_venue(event_name: str, artist_hint: Optional[str] = None, venue_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+def _guess_artist_and_venue(event_name: str,
+                            artist_hint: Optional[str] = None,
+                            venue_hint: Optional[str] = None,
+                            city_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Heuristiques simples :
+      - si artist_hint/venue_hint dispo → priorité
+      - sinon tente "ARTISTE @ LIEU" ou "ARTISTE - LIEU"
+      - si rien: artiste <- event_name (utile pour la jointure)
+    """
     artist = (artist_hint or "").strip() or None
     venue = (venue_hint or "").strip() or None
-    if not artist or not venue:
-        m = re.match(r"\s*(.+?)\s*(?:@|-|–|—)\s*(.+)\s*$", event_name or "", flags=re.IGNORECASE)
-        if m:
-            artist = artist or m.group(1).strip()
-            venue = venue or m.group(2).strip()
+
+    if (not artist or not venue) and event_name:
+        parts = _ARTIST_SEP.split(event_name)
+        if len(parts) >= 2:
+            artist = artist or parts[0].strip()
+            venue = venue or parts[1].strip()
+
+    if not artist:
+        artist = (event_name or "").strip() or None
+
+    if not venue:
+        venue = (city_hint or None)
+
+    # nettoyage soft
+    if artist:
+        artist = re.sub(r"\s+", " ", artist)
+    if venue:
+        venue = re.sub(r"\s+", " ", venue)
+
     return artist, venue
-
-
-def _fallback_artist_and_venue(e: NormalizedEvent) -> NormalizedEvent:
-    if not e.artist_name or not e.artist_name.strip():
-        m = re.match(r"\s*(.+?)\s*(?:@|-|–|—)\s*(.+)\s*$", e.event_name or "", flags=re.IGNORECASE)
-        if m:
-            e.artist_name = m.group(1).strip()
-            e.venue_name = e.venue_name or m.group(2).strip()
-        else:
-            e.artist_name = (e.event_name or "").strip()
-    return e
 
 
 # ------------------ Scraper principal ------------------
@@ -98,6 +111,7 @@ def _fallback_artist_and_venue(e: NormalizedEvent) -> NormalizedEvent:
 async def run() -> List[NormalizedEvent]:
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
+    out: List[NormalizedEvent] = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -107,13 +121,17 @@ async def run() -> List[NormalizedEvent]:
         context = await browser.new_context(
             locale="fr-FR",
             timezone_id="Europe/Paris",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+            ),
         )
         page = await context.new_page()
 
         # ---------- LOGIN ----------
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
+        # cookies
         try:
             btn = page.get_by_role("button", name=re.compile(r"(Accepter|Tout accepter|J.?accepte|Accept)", re.I)).first
             if await btn.is_visible(timeout=2000):
@@ -121,6 +139,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
+        # "se connecter par e-mail"
         try:
             trigger = page.get_by_role("button", name=re.compile(r"(e.?mail|email)", re.I)).first
             if await trigger.is_visible(timeout=2000):
@@ -128,6 +147,7 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
+        # credentials
         email_input = page.locator('input[type="email"]').first
         pwd_input = page.locator('input[type="password"]').first
         await email_input.fill(settings.shotgun_email)
@@ -135,11 +155,18 @@ async def run() -> List[NormalizedEvent]:
 
         submit = page.locator('button[type="submit"]').first
         try:
+            await email_input.press("Tab")
+            await pwd_input.press("Tab")
+        except Exception:
+            pass
+
+        try:
             await submit.wait_for(state="enabled", timeout=8000)
             await submit.click()
         except Exception:
             await pwd_input.press("Enter")
 
+        # ---------- EVENTS ----------
         try:
             await page.wait_for_url(re.compile(r".*/events.*"), timeout=45000)
         except Exception:
@@ -147,6 +174,7 @@ async def run() -> List[NormalizedEvent]:
 
         await page.goto(EVENTS_URL, wait_until="domcontentloaded")
 
+        # Onglet "Publié" si présent
         try:
             tab_publie = page.get_by_role("tab", name=re.compile(r"publié", re.I))
             if await tab_publie.is_visible(timeout=2000):
@@ -154,11 +182,13 @@ async def run() -> List[NormalizedEvent]:
         except Exception:
             pass
 
+        # Attendre qu’au moins une stat apparaisse
         try:
             await page.wait_for_selector(".ant-statistic-content", timeout=15000)
         except Exception:
             pass
 
+        # Scroll pour charger
         async def auto_scroll():
             prev = 0
             for _ in range(10):
@@ -171,18 +201,23 @@ async def run() -> List[NormalizedEvent]:
 
         await auto_scroll()
 
+        # Sélecteurs de cartes
         selectors = [
             "div.relative.flex.h-full.w-full.flex-col",
             "[class*='relative'][class*='flex'][class*='flex-col']",
-            "[data-testid='event-card']"
+            "[data-testid='event-card']",
         ]
         cards = []
         for sel in selectors:
-            cards = await page.query_selector_all(sel)
-            if cards:
-                break
+            try:
+                cards = await page.query_selector_all(sel)
+                if cards:
+                    break
+            except Exception:
+                continue
 
         if not cards:
+            # dumps debug minimalistes si besoin
             try:
                 await page.screenshot(path="events_empty.png", full_page=True)
                 html = await page.content()
@@ -191,11 +226,11 @@ async def run() -> List[NormalizedEvent]:
             except Exception:
                 pass
             await context.close(); await browser.close()
-            return []
+            log.info("Shotgun: 0 événements parsés")
+            return out
 
-        out: List[NormalizedEvent] = []
         for c in cards:
-            # --- Nom ---
+            # ---- Nom / artiste / salle/ville ----
             name_el = await c.query_selector("span.truncate.text-sm.font-medium")
             if not name_el:
                 name_el = await c.query_selector("span.font-medium, h3, a[title]")
@@ -204,55 +239,63 @@ async def run() -> List[NormalizedEvent]:
                 continue
 
             artist_el = await c.query_selector("[data-testid='artist-name'], .artist-name, .text-artist")
+            venue_el  = await c.query_selector("[data-testid='venue-name'], .venue-name, .text-venue")
+            city_el   = await c.query_selector("[data-testid='city-name'], .text-city, [class*='city']")
+
             artist_hint = (await artist_el.inner_text()).strip() if artist_el else None
-            venue_el = await c.query_selector("[data-testid='venue-name'], .venue-name, .text-venue")
-            venue_hint = (await venue_el.inner_text()).strip() if venue_el else None
-            city_el = await c.query_selector("[data-testid='city-name'], .text-city, [class*='city']")
-            city = (await city_el.inner_text()).strip() if city_el else None
+            venue_hint  = (await venue_el.inner_text()).strip() if venue_el else None
+            city        = (await city_el.inner_text()).strip() if city_el else None
 
-            artist_name, venue_name = _guess_artist_and_venue(event_name, artist_hint, venue_hint or city)
+            artist_name, venue_name = _guess_artist_and_venue(
+                event_name,
+                artist_hint=artist_hint,
+                venue_hint=venue_hint,
+                city_hint=city,
+            )
 
-            # --- Date ---
+            # ---- Date/heure locale (naïf) ----
             event_dt = None
             time_el = await c.query_selector("time[datetime]")
             if time_el:
-                iso_val = await time_el.get_attribute("datetime")
                 try:
+                    iso_val = await time_el.get_attribute("datetime")
                     event_dt = dateparser.parse(iso_val, settings={"RETURN_AS_TIMEZONE_AWARE": False})
                 except Exception:
                     event_dt = None
+
             if event_dt is None:
-                date_el = await c.query_selector("span.text-white-700.text-xs.font-normal")
+                date_el = await c.query_selector("span.text-white-700.text-xs.font-normal")  # déjà observé
                 if not date_el:
                     date_el = await c.query_selector("time, [class*='text-xs'], [data-testid='event-date']")
                 dt_text = (await date_el.inner_text()).strip() if date_el else None
                 event_dt = _parse_fr_datetime(dt_text)
 
-            # --- Statistiques (€, #, %) ---
+            # ---- Statistiques (€ / # / %) ----
             gross_total = None
             tickets_total = None
             sell_through_pct = None
-
             try:
                 values = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-value")
                 suffixes = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-suffix")
 
-                async def has_today(i: int) -> bool:
+                async def is_today(i: int) -> bool:
                     if i < len(suffixes):
-                        suf = (await suffixes[i].inner_text()).lower()
-                        return "aujourd" in suf
+                        try:
+                            suf = (await suffixes[i].inner_text()).lower()
+                            return "aujourd" in suf
+                        except Exception:
+                            return False
                     return False
 
                 euros, ints = [], []
                 for i, v in enumerate(values):
                     txt = (await v.inner_text()).strip()
                     if "€" in txt:
-                        val, _ = _parse_money(txt)
-                        euros.append((val, await has_today(i)))
+                        val = _parse_money(txt)
+                        euros.append((val, await is_today(i)))
                     else:
-                        ints.append((_parse_int(txt), await has_today(i)))
+                        ints.append((_parse_int(txt), await is_today(i)))
 
-                # on prend les premiers “totaux” (pas aujourd’hui)
                 for val, today in euros:
                     if not today:
                         gross_total = val
@@ -265,17 +308,16 @@ async def run() -> List[NormalizedEvent]:
                 pct_el = await c.query_selector("span.text-xs.font-semibold, [class*='font-semibold']")
                 if pct_el:
                     pct_txt = await pct_el.inner_text()
-                    stp = _parse_int(pct_txt)
-                    sell_through_pct = float(stp) if stp is not None else None
+                    sell_through_pct = float(_parse_int(pct_txt) or 0)
             except Exception:
                 pass
 
-            # --- Statut (simple heuristique) ---
+            # ---- Statut ----
             full_text = (await c.inner_text()).upper()
             status = "sold out" if "COMPLET" in full_text else "on sale"
 
-            # --- ID stable ---
-            dt_key = event_dt.isoformat() if event_dt else None
+            # ---- ID stable ----
+            dt_key = event_dt.date().isoformat() if isinstance(event_dt, datetime) else None
             event_id_provider = _stable_event_id(event_name, dt_key)
 
             out.append(NormalizedEvent(
@@ -284,7 +326,7 @@ async def run() -> List[NormalizedEvent]:
                 event_name=event_name,
                 city=city,
                 country=None,
-                event_datetime_local=event_dt,       # NAIF local
+                event_datetime_local=event_dt,      # NAÏF local (heure possible si dispo)
                 timezone="Europe/Paris",
                 status=status,
                 tickets_sold_total=tickets_total,
@@ -294,13 +336,12 @@ async def run() -> List[NormalizedEvent]:
                 sell_through_pct=sell_through_pct,
                 scrape_ts_utc=now,
                 ingestion_run_id=run_id,
-                # clés de matching
-                artist_name=artist_name,
+                # clés pour la jointure
+                artist_name=artist_name or "",
                 venue_name=venue_name or city,
             ))
 
-        # FIN: fermer proprement et RETOURNER out
-        await context.close()
-        await browser.close()
-        log.info("Shotgun: %d événements parsés", len(out))
-        return out
+        await context.close(); await browser.close()
+
+    log.info("Shotgun: %d événements parsés", len(out))
+    return out
