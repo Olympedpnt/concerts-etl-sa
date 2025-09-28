@@ -18,8 +18,9 @@ GRAPHQL_URL = "https://partners-endpoint.dice.fm/graphql"
 
 # ----------------------------- GraphQL ---------------------------------
 
+# ⚠️ On a retiré `$to` qui n'était pas utilisé et causait l'erreur.
 _EVENTS_QUERY = """
-query Events($after: String, $from: Datetime, $to: Datetime) {
+query Events($after: String, $from: Datetime) {
   viewer {
     events(first: 100, after: $after, where: { startDatetime: { gte: $from } }) {
       totalCount
@@ -61,36 +62,29 @@ def _pick_first(lst: Optional[List[Dict[str, Any]]], key: str) -> Optional[str]:
     v = (lst[0] or {}).get(key)
     return v.strip() if isinstance(v, str) else v
 
+def _isoz(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 # --------------------------- Fetch layer --------------------------------
 
 async def _gql(client: httpx.AsyncClient, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-    r = await client.post(
-        GRAPHQL_URL,
-        json={"query": query, "variables": variables},
-        timeout=30.0,
-    )
+    r = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables}, timeout=30.0)
     r.raise_for_status()
     payload = r.json()
-    if "errors" in payload and payload["errors"]:
+    if payload.get("errors"):
         raise RuntimeError(f"DICE GraphQL errors: {payload['errors']}")
     return payload["data"]
 
 async def fetch_events() -> List[Dict[str, Any]]:
-    """
-    Récupère tous les événements Dice (période -90j → +365j).
-    """
     token = settings.dice_api_token
     if not token:
         raise RuntimeError("DICE_API_TOKEN manquant (settings.dice_api_token).")
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    now = datetime.now(timezone.utc)
-    from_dt = (now - timedelta(days=90)).replace(hour=0, minute=0, second=0, microsecond=0)
-    to_dt = (now + timedelta(days=365)).replace(hour=23, minute=59, second=59, microsecond=0)
+    # On remonte 90 jours en arrière pour couvrir les shows proches
+    from_lower = datetime.now(timezone.utc) - timedelta(days=90)
+    from_lower = _isoz(from_lower.replace(hour=0, minute=0, second=0, microsecond=0))
 
     out: List[Dict[str, Any]] = []
     after: Optional[str] = None
@@ -99,15 +93,7 @@ async def fetch_events() -> List[Dict[str, Any]]:
     async with httpx.AsyncClient(headers=headers, timeout=15) as client:
         while True:
             page += 1
-            data = await _gql(
-                client,
-                _EVENTS_QUERY,
-                {
-                    "after": after,
-                    "from": from_dt.isoformat(),
-                    "to": to_dt.isoformat(),
-                },
-            )
+            data = await _gql(client, _EVENTS_QUERY, {"after": after, "from": from_lower})
             evs = data["viewer"]["events"]
             edges = evs.get("edges", [])
             out.extend([e["node"] for e in edges])
@@ -175,7 +161,5 @@ def _build_normalized(ev: Dict[str, Any]) -> NormalizedEvent:
 async def run() -> List[NormalizedEvent]:
     events = await fetch_events()
     loop = asyncio.get_event_loop()
-    built = await asyncio.gather(
-        *[loop.run_in_executor(None, _build_normalized, e) for e in events]
-    )
+    built = await asyncio.gather(*[loop.run_in_executor(None, _build_normalized, e) for e in events])
     return built
