@@ -304,23 +304,82 @@ async def run() -> List[NormalizedEvent]:
                 venue_hint=venue_hint or city,
             )
 
-            # --- Date/heure locale
+            # --- Date/heure locale (bétonnée) ---
             event_dt = None
 
+            # 1) Balise <time datetime="...">
             t = await c.query_selector("time[datetime]")
             if t:
                 try:
                     iso_val = await t.get_attribute("datetime")
-                    event_dt = _parse_fr_datetime(iso_val)
+                    if iso_val:
+                        event_dt = dateparser.parse(
+                            iso_val,
+                            settings={"RETURN_AS_TIMEZONE_AWARE": False}
+                        )
                 except Exception:
                     event_dt = None
 
+            # 2) Fallback: texte voisin (petit libellé date)
             if event_dt is None:
                 date_el = await c.query_selector(
-                    "span.text-white-700.text-xs.font-normal, time, [data-testid='event-date'], [class*='text-xs']"
+                    "span.text-white-700.text-xs.font-normal, "
+                    "time, [data-testid='event-date'], [class*='text-xs']"
                 )
                 dt_text = (await date_el.inner_text()).strip() if date_el else None
-                event_dt = _parse_fr_datetime(dt_text)
+                if dt_text:
+                    event_dt = dateparser.parse(
+                        dt_text,
+                        languages=["fr"],
+                        settings={
+                            "TIMEZONE": "Europe/Paris",
+                            "RETURN_AS_TIMEZONE_AWARE": False,
+                            "PREFER_DATES_FROM": "future",
+                        },
+                    )
+
+            # 3) Fallback ultime: on racle tout le texte de la carte et on cherche:
+            #    - un ISO (2025-11-29T19:00)
+            #    - ou un motif FR "ven. 10 oct. 2025 19:30" / "10 oct. 2025 19:30" / "10 octobre 2025 19:30"
+            if event_dt is None:
+                try:
+                    raw = await c.inner_text()
+                    # ISO
+                    m = re.search(r"\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)", raw)
+                    if m:
+                        event_dt = dateparser.parse(
+                            m.group(1),
+                            settings={"RETURN_AS_TIMEZONE_AWARE": False}
+                        )
+                    if event_dt is None:
+                        # FR courte (avec mois abrégé) ou longue
+                        # ex: "ven. 10 oct. 2025 19:30" / "10 octobre 2025 19:30"
+                        m = re.search(
+                            r"(?:(?:lun|mar|mer|jeu|ven|sam|dim)\.?\s*)?"
+                            r"(\d{1,2}\s+[A-Za-zéûîôàç\.]+\.?\s+\d{4}(?:\s+\d{1,2}:\d{2})?)",
+                            raw, flags=re.IGNORECASE
+                        )
+                        if m:
+                            event_dt = dateparser.parse(
+                                m.group(1),
+                                languages=["fr"],
+                                settings={
+                                    "TIMEZONE": "Europe/Paris",
+                                    "RETURN_AS_TIMEZONE_AWARE": False,
+                                    "PREFER_DATES_FROM": "future",
+                                },
+                            )
+                except Exception:
+                    pass
+
+            # 4) Si on n'a toujours rien, trace courte pour debug
+            if event_dt is None:
+                try:
+                    snippet = (await c.inner_text())[:200].replace("\n", " ")
+                    log.debug("Shotgun: date introuvable pour %r ; snippet=%r", event_name, snippet)
+                except Exception:
+                    log.debug("Shotgun: date introuvable pour %r (no snippet)", event_name)
+
 
             # --- Statistiques (€, #, %)
             gross_total = None
