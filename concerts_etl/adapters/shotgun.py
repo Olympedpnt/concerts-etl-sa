@@ -381,46 +381,53 @@ async def run() -> List[NormalizedEvent]:
                     log.debug("Shotgun: date introuvable pour %r (no snippet)", event_name)
 
 
-            # --- Statistiques (€, #, %)
+            # --- Statistiques (€, #, %) ---
             gross_total = None
             tickets_total = None
             sell_through_pct = None
 
             try:
+                # toutes les valeurs numériques
                 values = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-value")
                 suffixes = await c.query_selector_all(".ant-statistic-content .ant-statistic-content-suffix")
 
-                def _suffix_is_today(idx: int, suf_nodes) -> bool:
+                async def _suffix_text(node):
                     try:
-                        if idx < len(suf_nodes):
-                            # Playwright Locator -> handle inner_text synchrone via eval
-                            return False  # on ignore “aujourd'hui” pour l’instant
+                        return (await node.inner_text()).lower().strip()
                     except Exception:
-                        return False
-                    return False
+                        return ""
 
-                euros, ints = [], []
+                # On mappe value[i] ↔ suffix[i] si dispo
+                vals = []
                 for i, v in enumerate(values):
                     txt = (await v.inner_text()).strip()
-                    if "€" in txt:
-                        val, _ = _parse_money(txt)
-                        euros.append((val, _suffix_is_today(i, suffixes)))
-                    else:
-                        ints.append((_parse_int(txt), _suffix_is_today(i, suffixes)))
+                    suf = ""
+                    if i < len(suffixes):
+                        suf = await _suffix_text(suffixes[i])
+                    vals.append((txt, suf))
 
-                for val, today in euros:
-                    if not today:
+                # on prend le premier entier sans suffixe "aujourd"
+                for txt, suf in vals:
+                    if "aujourd" in suf:
+                        continue
+                    num = _parse_int(txt)
+                    if num is not None:
+                        tickets_total = num
+                        break
+
+                # idem pour les montants €
+                for txt, suf in vals:
+                    if "€" in txt and "aujourd" not in suf:
+                        val, _ = _parse_money(txt)
                         gross_total = val
                         break
-                for val, today in ints:
-                    if not today:
-                        tickets_total = val
-                        break
 
+                # % (si présent quelque part)
                 pct_el = await c.query_selector("span.text-xs.font-semibold, [class*='font-semibold']")
                 if pct_el:
-                    pct_txt = await pct_el.inner_text()
+                    pct_txt = (await pct_el.inner_text()).strip()
                     sell_through_pct = float(_parse_int(pct_txt) or 0)
+
             except Exception:
                 pass
 
